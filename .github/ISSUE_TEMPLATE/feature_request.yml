@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose a focused improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What research or development workflow is blocked today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed direction
+      description: Describe the smallest useful change and relevant tradeoffs.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Note existing Burn, CubeCL, WGPU, or Vulkan capabilities that may overlap.

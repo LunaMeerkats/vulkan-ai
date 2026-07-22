@@ -1,0 +1,7 @@
+/target/
+/.idea/
+/.vscode/
+*.profraw
+
+# Local source material retained outside the maintained documentation set.
+/deep-research-report.md

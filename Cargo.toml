@@ -1,0 +1,30 @@
+[package]
+name = "vulkan-ai"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Research tooling for training neural networks through Vulkan"
+license = "Apache-2.0"
+repository = "https://github.com/LunaMeerkats/vulkan-ai"
+readme = "README.md"
+publish = false
+
+[features]
+default = ["cpu"]
+cpu = ["burn/flex"]
+vulkan = ["burn/vulkan"]
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["autodiff", "std"] }
+
+[[bin]]
+name = "vulkan-ai-probe"
+path = "src/bin/vulkan-ai-probe.rs"
+required-features = ["vulkan"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
