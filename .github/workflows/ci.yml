@@ -31,5 +31,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all-targets
-      - name: Compile Vulkan path
-        run: cargo check --no-default-features --features vulkan --bin vulkan-ai-probe
+      - name: Test Vulkan path
+        run: cargo test --no-default-features --features vulkan --bin vulkan-ai-probe
