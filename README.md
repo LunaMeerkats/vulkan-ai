@@ -34,7 +34,9 @@ cargo run --no-default-features --features vulkan --bin vulkan-ai-probe
 You need a Vulkan-capable device and a working Vulkan driver. The probe forces
 Burn's Vulkan graphics API and uses its SPIR-V compiler path.
 
-Expected values are:
+The probe first reports the selected adapter, driver, subgroup range, and
+effective compute and buffer limits. It then prints the calculation results,
+whose expected values are:
 
 ```text
 Vulkan forward output: [8.0, 18.0]

@@ -7,5 +7,6 @@ Describe what changed and why.
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test --all-targets`
+- [ ] `cargo test --no-default-features --features vulkan --bin vulkan-ai-probe`
 - [ ] Vulkan-specific behavior was tested or clearly marked as compile-only
 - [ ] `CHANGELOG.md` was updated when the change is user-visible
