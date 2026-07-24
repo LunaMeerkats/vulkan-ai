@@ -20,7 +20,7 @@ burn = { version = "0.21.0", default-features = false, features = ["autodiff", "
 [[bin]]
 name = "vulkan-ai-probe"
 path = "src/bin/vulkan-ai-probe.rs"
-required-features = ["vulkan"]
+required-features = ["cpu", "vulkan"]
 
 [lints.rust]
 unsafe_code = "forbid"

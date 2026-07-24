@@ -25,18 +25,21 @@ CI without a GPU:
 cargo test
 ```
 
-To execute the same forward and backward calculation through Vulkan:
+To execute the compatibility probe through Vulkan and compare a deterministic
+linear-model training step with the CPU backend:
 
 ```shell
-cargo run --no-default-features --features vulkan --bin vulkan-ai-probe
+cargo run --features vulkan --bin vulkan-ai-probe
 ```
 
 You need a Vulkan-capable device and a working Vulkan driver. The probe forces
 Burn's Vulkan graphics API and uses its SPIR-V compiler path.
 
 The probe first reports the selected adapter, driver, subgroup range, and
-effective compute and buffer limits. It then prints the calculation results,
-whose expected values are:
+effective compute and buffer limits. It then prints the calculation results
+and fails if the linear model's predictions, loss, or parameter gradients
+differ from the CPU reference beyond an absolute plus relative tolerance of
+`1e-5` each.
 
 ```text
 Vulkan forward output: [8.0, 18.0]
@@ -45,8 +48,6 @@ Vulkan weight gradient: [4.0, 6.0]
 
 ## Near-term roadmap
 
-- Report the selected Vulkan adapter and relevant device capabilities.
-- Add CPU/Vulkan gradient parity tests for a small trainable model.
 - Record reproducible timing, fusion, and synchronization diagnostics.
 - Implement one custom operation with an explicit backward rule.
 - Document the boundary between Burn/CubeCL extensions and direct Vulkan

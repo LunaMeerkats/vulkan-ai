@@ -15,5 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CPU-based test coverage and continuous integration checks.
 - Architecture decision record for the initial Burn/Vulkan backend strategy.
 - Vulkan adapter, driver, subgroup, and compute-limit reporting.
+- CPU/Vulkan prediction, loss, and parameter-gradient parity checks for a
+  deterministic linear model.
 
 [Unreleased]: https://github.com/LunaMeerkats/vulkan-ai/commits/main

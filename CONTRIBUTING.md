@@ -19,12 +19,12 @@ Run the checks used by continuous integration:
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
-cargo test --no-default-features --features vulkan --bin vulkan-ai-probe
+cargo test --features vulkan --bin vulkan-ai-probe
 ```
 
 The Vulkan test command compiles the GPU path and runs unit tests that do not
 initialize a GPU. Running the probe itself requires a compatible device and
-driver.
+driver and compares its training results with the CPU backend.
 
 ## Compatibility and releases
 
