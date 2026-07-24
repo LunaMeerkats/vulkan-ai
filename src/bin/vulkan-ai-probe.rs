@@ -1,11 +1,15 @@
 #![recursion_limit = "256"]
 
 use burn::backend::{
-    Autodiff, Vulkan as VulkanBackend,
+    Autodiff, Flex, Vulkan as VulkanBackend,
+    flex::FlexDevice,
     wgpu::{RuntimeOptions, WgpuDevice, graphics::Vulkan as VulkanGraphics, init_setup},
 };
 use std::fmt;
-use vulkan_ai::run_autodiff_probe;
+use vulkan_ai::{TrainingProbeResult, run_autodiff_probe, run_training_probe};
+
+const PARITY_ABSOLUTE_TOLERANCE: f32 = 1.0e-5;
+const PARITY_RELATIVE_TOLERANCE: f32 = 1.0e-5;
 
 #[derive(Debug, PartialEq, Eq)]
 struct VulkanAdapterReport {
@@ -109,7 +113,8 @@ fn value_or_unavailable(value: &str) -> &str {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    type Backend = Autodiff<VulkanBackend>;
+    type CpuBackend = Autodiff<Flex>;
+    type VulkanAutodiffBackend = Autodiff<VulkanBackend>;
 
     let device = WgpuDevice::DefaultDevice;
     let setup = init_setup::<VulkanGraphics>(&device, RuntimeOptions::default());
@@ -140,17 +145,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_buffer_size: device_limits.max_buffer_size,
     };
 
-    let result = run_autodiff_probe::<Backend>(&device)?;
+    let result = run_autodiff_probe::<VulkanAutodiffBackend>(&device)?;
+    let cpu_training_result = run_training_probe::<CpuBackend>(&FlexDevice)?;
+    let vulkan_training_result = run_training_probe::<VulkanAutodiffBackend>(&device)?;
+    check_training_parity(&cpu_training_result, &vulkan_training_result)?;
+
     println!("{adapter_report}");
     println!("Vulkan forward output: {:?}", result.output);
     println!("Vulkan weight gradient: {:?}", result.weight_gradient);
+    println!(
+        "Vulkan training predictions: {:?}",
+        vulkan_training_result.predictions
+    );
+    println!("Vulkan training loss: {}", vulkan_training_result.loss);
+    println!(
+        "Vulkan training weight gradient: {:?}",
+        vulkan_training_result.weight_gradient
+    );
+    println!(
+        "Vulkan training bias gradient: {:?}",
+        vulkan_training_result.bias_gradient
+    );
+    println!(
+        "CPU/Vulkan training parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+    );
+
+    Ok(())
+}
+
+fn check_training_parity(
+    cpu: &TrainingProbeResult,
+    vulkan: &TrainingProbeResult,
+) -> Result<(), String> {
+    check_values("predictions", &cpu.predictions, &vulkan.predictions)?;
+    check_values("loss", &[cpu.loss], &[vulkan.loss])?;
+    check_values(
+        "weight gradient",
+        &cpu.weight_gradient,
+        &vulkan.weight_gradient,
+    )?;
+    check_values("bias gradient", &cpu.bias_gradient, &vulkan.bias_gradient)
+}
+
+fn check_values(name: &str, cpu: &[f32], vulkan: &[f32]) -> Result<(), String> {
+    if cpu.len() != vulkan.len() {
+        return Err(format!(
+            "CPU/Vulkan {name} length differs: {} versus {}",
+            cpu.len(),
+            vulkan.len()
+        ));
+    }
+
+    for (index, (&cpu_value, &vulkan_value)) in cpu.iter().zip(vulkan).enumerate() {
+        if !cpu_value.is_finite() || !vulkan_value.is_finite() {
+            return Err(format!(
+                "CPU/Vulkan {name} contains a non-finite value at index {index}: {cpu_value} versus {vulkan_value}"
+            ));
+        }
+
+        let tolerance = PARITY_ABSOLUTE_TOLERANCE + PARITY_RELATIVE_TOLERANCE * cpu_value.abs();
+        if (cpu_value - vulkan_value).abs() > tolerance {
+            return Err(format!(
+                "CPU/Vulkan {name} differs at index {index}: {cpu_value} versus {vulkan_value} (tolerance {tolerance})"
+            ));
+        }
+    }
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::VulkanAdapterReport;
+    use super::{TrainingProbeResult, VulkanAdapterReport, check_training_parity};
 
     #[test]
     fn formats_vulkan_adapter_report() {
@@ -195,5 +261,48 @@ Vulkan compute capabilities:
   Max storage buffers/shader stage: 8
   Max buffer size: 268435456 bytes"
         );
+    }
+
+    #[test]
+    fn accepts_training_results_within_tolerance() {
+        let cpu = training_result(0.5);
+        let vulkan = training_result(0.500_009);
+
+        check_training_parity(&cpu, &vulkan).unwrap();
+    }
+
+    #[test]
+    fn rejects_training_results_outside_tolerance() {
+        let cpu = training_result(0.5);
+        let vulkan = training_result(0.51);
+
+        let error = check_training_parity(&cpu, &vulkan).unwrap_err();
+
+        assert_eq!(
+            error,
+            "CPU/Vulkan loss differs at index 0: 0.5 versus 0.51 (tolerance 0.000015)"
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_training_results() {
+        let cpu = training_result(0.5);
+        let vulkan = training_result(f32::NAN);
+
+        let error = check_training_parity(&cpu, &vulkan).unwrap_err();
+
+        assert_eq!(
+            error,
+            "CPU/Vulkan loss contains a non-finite value at index 0: 0.5 versus NaN"
+        );
+    }
+
+    fn training_result(loss: f32) -> TrainingProbeResult {
+        TrainingProbeResult {
+            predictions: vec![0.1, 0.6, -0.525],
+            loss,
+            weight_gradient: vec![-3.383_333_4, -4.941_667],
+            bias_gradient: vec![-1.55],
+        }
     }
 }

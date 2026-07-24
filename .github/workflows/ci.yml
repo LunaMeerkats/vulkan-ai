@@ -32,4 +32,4 @@ jobs:
       - name: Test
         run: cargo test --all-targets
       - name: Test Vulkan path
-        run: cargo test --no-default-features --features vulkan --bin vulkan-ai-probe
+        run: cargo test --features vulkan --bin vulkan-ai-probe
