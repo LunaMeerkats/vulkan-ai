@@ -33,3 +33,5 @@ jobs:
         run: cargo test --all-targets
       - name: Test Vulkan path
         run: cargo test --features vulkan --bin vulkan-ai-probe
+      - name: Test fused Vulkan path
+        run: cargo test --features vulkan-fusion --bin vulkan-ai-probe

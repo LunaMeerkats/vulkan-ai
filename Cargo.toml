@@ -13,6 +13,7 @@ publish = false
 default = ["cpu"]
 cpu = ["burn/flex"]
 vulkan = ["burn/vulkan"]
+vulkan-fusion = ["vulkan", "burn/fusion"]
 
 [dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["autodiff", "std"] }

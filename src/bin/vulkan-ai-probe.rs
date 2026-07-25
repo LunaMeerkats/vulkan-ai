@@ -5,11 +5,21 @@ use burn::backend::{
     flex::FlexDevice,
     wgpu::{RuntimeOptions, WgpuDevice, graphics::Vulkan as VulkanGraphics, init_setup},
 };
-use std::fmt;
-use vulkan_ai::{TrainingProbeResult, run_autodiff_probe, run_training_probe};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
+use vulkan_ai::{
+    ProbeError, TrainingProbeResult, run_autodiff_probe, run_synchronized_training_workload,
+    run_training_probe,
+};
 
 const PARITY_ABSOLUTE_TOLERANCE: f32 = 1.0e-5;
 const PARITY_RELATIVE_TOLERANCE: f32 = 1.0e-5;
+const TIMING_WARMUP_ITERATIONS: usize = 5;
+const TIMING_MEASURED_ITERATIONS: usize = 20;
+const TIMING_SCOPE: &str = "allocation+forward+mse+backward; host readback excluded";
+const TIMING_SYNCHRONIZATION: &str = "Burn Backend::sync after every iteration";
 
 #[derive(Debug, PartialEq, Eq)]
 struct VulkanAdapterReport {
@@ -30,6 +40,24 @@ struct VulkanAdapterReport {
     max_storage_buffer_binding_size: u64,
     max_storage_buffers_per_shader_stage: u32,
     max_buffer_size: u64,
+}
+
+#[derive(Debug, PartialEq)]
+struct TimingSummary {
+    min: f64,
+    median: f64,
+    p95: f64,
+    max: f64,
+}
+
+#[derive(Debug, PartialEq)]
+struct VulkanTimingReport {
+    build_profile: &'static str,
+    fusion: &'static str,
+    tasks_max: usize,
+    warmup_iterations: usize,
+    samples_ms: Vec<f64>,
+    summary: TimingSummary,
 }
 
 impl fmt::Display for VulkanAdapterReport {
@@ -104,6 +132,48 @@ impl fmt::Display for VulkanAdapterReport {
     }
 }
 
+impl fmt::Display for VulkanTimingReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "Vulkan timing protocol:")?;
+        writeln!(formatter, "  Build profile: {}", self.build_profile)?;
+        writeln!(formatter, "  Fusion: {}", self.fusion)?;
+        writeln!(formatter, "  Command task batch limit: {}", self.tasks_max)?;
+        writeln!(formatter, "  Workload: {TIMING_SCOPE}")?;
+        writeln!(
+            formatter,
+            "  Warm-up iterations: {}",
+            self.warmup_iterations
+        )?;
+        writeln!(
+            formatter,
+            "  Measured iterations: {}",
+            self.samples_ms.len()
+        )?;
+        writeln!(formatter, "  Synchronization: {TIMING_SYNCHRONIZATION}")?;
+        writeln!(formatter, "Vulkan synchronized training timing:")?;
+        writeln!(formatter, "  Min: {:.6} ms", self.summary.min)?;
+        writeln!(formatter, "  Median: {:.6} ms", self.summary.median)?;
+        writeln!(formatter, "  P95: {:.6} ms", self.summary.p95)?;
+        writeln!(formatter, "  Max: {:.6} ms", self.summary.max)?;
+        write!(
+            formatter,
+            "Vulkan timing JSON: {{\"schema\":1,\"build_profile\":\"{}\",\"fusion\":\"{}\",\"tasks_max\":{},\"scope\":\"{TIMING_SCOPE}\",\"warmup_iterations\":{},\"synchronization\":\"{TIMING_SYNCHRONIZATION}\",\"samples_ms\":[",
+            self.build_profile, self.fusion, self.tasks_max, self.warmup_iterations
+        )?;
+        for (index, sample) in self.samples_ms.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{sample:.6}")?;
+        }
+        write!(
+            formatter,
+            "],\"min_ms\":{:.6},\"median_ms\":{:.6},\"p95_ms\":{:.6},\"max_ms\":{:.6}}}",
+            self.summary.min, self.summary.median, self.summary.p95, self.summary.max
+        )
+    }
+}
+
 fn value_or_unavailable(value: &str) -> &str {
     if value.is_empty() {
         "unavailable"
@@ -117,7 +187,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     type VulkanAutodiffBackend = Autodiff<VulkanBackend>;
 
     let device = WgpuDevice::DefaultDevice;
-    let setup = init_setup::<VulkanGraphics>(&device, RuntimeOptions::default());
+    let runtime_options = RuntimeOptions::default();
+    let tasks_max = runtime_options.tasks_max;
+    let setup = init_setup::<VulkanGraphics>(&device, runtime_options);
     let adapter_info = setup.adapter.get_info();
     let device_limits = setup.device.limits();
 
@@ -145,6 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_buffer_size: device_limits.max_buffer_size,
     };
 
+    let timing_report = measure_training_timing::<VulkanAutodiffBackend>(&device, tasks_max)?;
     let result = run_autodiff_probe::<VulkanAutodiffBackend>(&device)?;
     let cpu_training_result = run_training_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_training_result = run_training_probe::<VulkanAutodiffBackend>(&device)?;
@@ -169,8 +242,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "CPU/Vulkan training parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
+    println!("{timing_report}");
 
     Ok(())
+}
+
+fn measure_training_timing<B>(
+    device: &B::Device,
+    tasks_max: usize,
+) -> Result<VulkanTimingReport, ProbeError>
+where
+    B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>,
+{
+    for _ in 0..TIMING_WARMUP_ITERATIONS {
+        run_synchronized_training_workload::<B>(device)?;
+    }
+
+    let mut samples = Vec::with_capacity(TIMING_MEASURED_ITERATIONS);
+    for _ in 0..TIMING_MEASURED_ITERATIONS {
+        let start = Instant::now();
+        run_synchronized_training_workload::<B>(device)?;
+        samples.push(start.elapsed());
+    }
+
+    Ok(timing_report(&samples, tasks_max))
+}
+
+fn timing_report(samples: &[Duration], tasks_max: usize) -> VulkanTimingReport {
+    assert!(!samples.is_empty(), "timing requires at least one sample");
+
+    let samples_ms = samples
+        .iter()
+        .map(|sample| sample.as_secs_f64() * 1_000.0)
+        .collect::<Vec<_>>();
+    let mut sorted = samples_ms.clone();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    let median = if sorted.len().is_multiple_of(2) {
+        f64::midpoint(sorted[middle - 1], sorted[middle])
+    } else {
+        sorted[middle]
+    };
+    let p95_index = (sorted.len() * 95).div_ceil(100) - 1;
+    let summary = TimingSummary {
+        min: sorted[0],
+        median,
+        p95: sorted[p95_index],
+        max: sorted[sorted.len() - 1],
+    };
+
+    VulkanTimingReport {
+        build_profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        fusion: if cfg!(feature = "vulkan-fusion") {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        tasks_max,
+        warmup_iterations: TIMING_WARMUP_ITERATIONS,
+        samples_ms,
+        summary,
+    }
 }
 
 fn check_training_parity(
@@ -216,7 +352,12 @@ fn check_values(name: &str, cpu: &[f32], vulkan: &[f32]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TrainingProbeResult, VulkanAdapterReport, check_training_parity};
+    use std::time::Duration;
+
+    use super::{
+        TIMING_SCOPE, TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult,
+        VulkanAdapterReport, check_training_parity, timing_report,
+    };
 
     #[test]
     fn formats_vulkan_adapter_report() {
@@ -295,6 +436,37 @@ Vulkan compute capabilities:
             error,
             "CPU/Vulkan loss contains a non-finite value at index 0: 0.5 versus NaN"
         );
+    }
+
+    #[test]
+    fn summarizes_and_serializes_timing_samples() {
+        let report = timing_report(
+            &[
+                Duration::from_millis(4),
+                Duration::from_millis(1),
+                Duration::from_millis(3),
+                Duration::from_millis(2),
+            ],
+            32,
+        );
+
+        assert_eq!(
+            report.summary,
+            TimingSummary {
+                min: 1.0,
+                median: 2.5,
+                p95: 4.0,
+                max: 4.0,
+            }
+        );
+        let formatted = report.to_string();
+        assert!(formatted.contains("  Warm-up iterations: 5"));
+        assert!(formatted.contains("  Measured iterations: 4"));
+        assert!(formatted.contains(&format!("  Workload: {TIMING_SCOPE}")));
+        assert!(formatted.contains(&format!("  Synchronization: {TIMING_SYNCHRONIZATION}")));
+        assert!(formatted.contains(
+            "\"samples_ms\":[4.000000,1.000000,3.000000,2.000000],\"min_ms\":1.000000,\"median_ms\":2.500000,\"p95_ms\":4.000000,\"max_ms\":4.000000"
+        ));
     }
 
     fn training_result(loss: f32) -> TrainingProbeResult {

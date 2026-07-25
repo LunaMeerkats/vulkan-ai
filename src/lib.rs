@@ -43,6 +43,8 @@ pub enum ProbeError {
     MissingBiasGradient,
     /// Tensor data could not be converted to the expected `f32` values.
     DataConversion(String),
+    /// The backend could not synchronize the training workload.
+    Synchronization(String),
 }
 
 impl fmt::Display for ProbeError {
@@ -55,11 +57,27 @@ impl fmt::Display for ProbeError {
             Self::DataConversion(message) => {
                 write!(formatter, "could not read probe tensor data: {message}")
             }
+            Self::Synchronization(message) => {
+                write!(
+                    formatter,
+                    "could not synchronize the training workload: {message}"
+                )
+            }
         }
     }
 }
 
 impl Error for ProbeError {}
+
+struct TrainingProbeTensors<B>
+where
+    B: AutodiffBackend,
+{
+    predictions: Tensor<B, 2>,
+    loss: Tensor<B, 1>,
+    weight_gradient: Tensor<B::InnerBackend, 2>,
+    bias_gradient: Tensor<B::InnerBackend, 1>,
+}
 
 /// Run a deterministic matrix multiplication and backward pass.
 ///
@@ -108,6 +126,62 @@ pub fn run_training_probe<B>(device: &B::Device) -> Result<TrainingProbeResult, 
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
+    let result = execute_training_probe::<B>(device)?;
+
+    let loss_values = result
+        .loss
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ProbeError::DataConversion(error.to_string()))?;
+    let loss = loss_values
+        .first()
+        .copied()
+        .ok_or_else(|| ProbeError::DataConversion("loss tensor was empty".to_owned()))?;
+
+    Ok(TrainingProbeResult {
+        predictions: result
+            .predictions
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
+        loss,
+        weight_gradient: result
+            .weight_gradient
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
+        bias_gradient: result
+            .bias_gradient
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
+    })
+}
+
+/// Run the deterministic training workload and wait for backend completion.
+///
+/// Unlike [`run_training_probe`], this function does not read tensor values
+/// back to the host. It is intended for timing the allocation, forward, loss,
+/// backward, and explicit synchronization path without transfer overhead.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] if the backend omits a parameter gradient or cannot
+/// synchronize the workload.
+pub fn run_synchronized_training_workload<B>(device: &B::Device) -> Result<(), ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    let result = execute_training_probe::<B>(device)?;
+    B::sync(device).map_err(|error| ProbeError::Synchronization(error.to_string()))?;
+    std::hint::black_box(result);
+    Ok(())
+}
+
+fn execute_training_probe<B>(device: &B::Device) -> Result<TrainingProbeTensors<B>, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
     let input = Tensor::<B, 2>::from_floats([[1.0, 2.0], [3.0, 4.0], [-1.0, 0.5]], device);
     let target = Tensor::<B, 2>::from_floats([[1.0], [2.0], [-0.5]], device);
     let model = Linear {
@@ -130,29 +204,11 @@ where
         .grad(&gradients)
         .ok_or(ProbeError::MissingBiasGradient)?;
 
-    let loss_values = loss
-        .into_data()
-        .into_vec::<f32>()
-        .map_err(|error| ProbeError::DataConversion(error.to_string()))?;
-    let loss = loss_values
-        .first()
-        .copied()
-        .ok_or_else(|| ProbeError::DataConversion("loss tensor was empty".to_owned()))?;
-
-    Ok(TrainingProbeResult {
-        predictions: predictions
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
+    Ok(TrainingProbeTensors {
+        predictions,
         loss,
-        weight_gradient: weight_gradient
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
-        bias_gradient: bias_gradient
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
+        weight_gradient,
+        bias_gradient,
     })
 }
 
@@ -160,7 +216,10 @@ where
 mod tests {
     use burn::backend::{Autodiff, Flex, flex::FlexDevice};
 
-    use super::{ProbeResult, TrainingProbeResult, run_autodiff_probe, run_training_probe};
+    use super::{
+        ProbeResult, TrainingProbeResult, run_autodiff_probe, run_synchronized_training_workload,
+        run_training_probe,
+    };
 
     #[test]
     fn computes_expected_output_and_gradient() {
@@ -193,6 +252,13 @@ mod tests {
         assert_values_close(&[result.loss], &[expected.loss]);
         assert_values_close(&result.weight_gradient, &expected.weight_gradient);
         assert_values_close(&result.bias_gradient, &expected.bias_gradient);
+    }
+
+    #[test]
+    fn synchronizes_training_workload_without_readback() {
+        type Backend = Autodiff<Flex>;
+
+        run_synchronized_training_workload::<Backend>(&FlexDevice).unwrap();
     }
 
     fn assert_values_close(actual: &[f32], expected: &[f32]) {
