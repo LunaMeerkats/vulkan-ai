@@ -41,6 +41,21 @@ and fails if the linear model's predictions, loss, or parameter gradients
 differ from the CPU reference beyond an absolute plus relative tolerance of
 `1e-5` each.
 
+The probe also times the same training workload with five warm-up iterations
+and 20 measured iterations. Every iteration ends with an explicit Burn backend
+synchronization, and host readback is excluded. The report records the build
+profile, fusion state, command task batch limit, raw samples, and min, median,
+P95, and max latency. Use a release build for comparable measurements:
+
+```shell
+cargo run --release --features vulkan --bin vulkan-ai-probe
+cargo run --release --features vulkan-fusion --bin vulkan-ai-probe
+```
+
+The first command measures the unfused backend; the second enables Burn's
+fusion optimizer. Timing output includes a single-line JSON record suitable
+for storing and comparing runs.
+
 ```text
 Vulkan forward output: [8.0, 18.0]
 Vulkan weight gradient: [4.0, 6.0]
@@ -48,7 +63,6 @@ Vulkan weight gradient: [4.0, 6.0]
 
 ## Near-term roadmap
 
-- Record reproducible timing, fusion, and synchronization diagnostics.
 - Implement one custom operation with an explicit backward rule.
 - Document the boundary between Burn/CubeCL extensions and direct Vulkan
   interoperability in an architecture decision record.

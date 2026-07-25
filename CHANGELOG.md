@@ -17,5 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vulkan adapter, driver, subgroup, and compute-limit reporting.
 - CPU/Vulkan prediction, loss, and parameter-gradient parity checks for a
   deterministic linear model.
+- Reproducible synchronized Vulkan timing reports with raw JSON samples,
+  summary statistics, runtime settings, and optional Burn fusion.
 
 [Unreleased]: https://github.com/LunaMeerkats/vulkan-ai/commits/main
