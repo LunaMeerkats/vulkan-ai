@@ -25,7 +25,8 @@ cargo test --features vulkan-fusion --bin vulkan-ai-probe
 
 The Vulkan test command compiles the GPU path and runs unit tests that do not
 initialize a GPU. Running the probe itself requires a compatible device and
-driver and compares its training results with the CPU backend. Use
+driver and compares its training and custom-operation results with the CPU
+backend. Use
 `cargo run --release --features vulkan` and repeat with `vulkan-fusion` when
 changing timing, fusion, or synchronization behavior.
 

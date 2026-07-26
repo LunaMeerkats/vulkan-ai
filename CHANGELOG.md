@@ -19,5 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministic linear model.
 - Reproducible synchronized Vulkan timing reports with raw JSON samples,
   summary statistics, runtime settings, and optional Burn fusion.
+- Backend-generic custom `x² + x` operation with an explicit `2x + 1`
+  backward rule and CPU/Vulkan parity coverage.
 
 [Unreleased]: https://github.com/LunaMeerkats/vulkan-ai/commits/main
