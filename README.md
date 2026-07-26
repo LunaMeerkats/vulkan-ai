@@ -39,7 +39,8 @@ The probe first reports the selected adapter, driver, subgroup range, and
 effective compute and buffer limits. It then prints the calculation results
 and fails if the linear model's predictions, loss, or parameter gradients
 differ from the CPU reference beyond an absolute plus relative tolerance of
-`1e-5` each.
+`1e-5` each. It also validates a custom element-wise `x² + x` operation and
+its explicitly registered `2x + 1` backward rule on CPU and Vulkan.
 
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
@@ -59,11 +60,12 @@ for storing and comparing runs.
 ```text
 Vulkan forward output: [8.0, 18.0]
 Vulkan weight gradient: [4.0, 6.0]
+Vulkan custom quadratic output: [2.0, -0.25, 0.0, 3.75]
+Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 ```
 
 ## Near-term roadmap
 
-- Implement one custom operation with an explicit backward rule.
 - Document the boundary between Burn/CubeCL extensions and direct Vulkan
   interoperability in an architecture decision record.
 

@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    ProbeError, TrainingProbeResult, run_autodiff_probe, run_synchronized_training_workload,
-    run_training_probe,
+    CustomOpProbeResult, ProbeError, TrainingProbeResult, run_autodiff_probe, run_custom_op_probe,
+    run_synchronized_training_workload, run_training_probe,
 };
 
 const PARITY_ABSOLUTE_TOLERANCE: f32 = 1.0e-5;
@@ -222,6 +222,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_training_result = run_training_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_training_result = run_training_probe::<VulkanAutodiffBackend>(&device)?;
     check_training_parity(&cpu_training_result, &vulkan_training_result)?;
+    let cpu_custom_result = run_custom_op_probe::<CpuBackend>(&FlexDevice)?;
+    let vulkan_custom_result = run_custom_op_probe::<VulkanAutodiffBackend>(&device)?;
+    check_custom_op_parity(&cpu_custom_result, &vulkan_custom_result)?;
 
     println!("{adapter_report}");
     println!("Vulkan forward output: {:?}", result.output);
@@ -241,6 +244,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "CPU/Vulkan training parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+    );
+    println!(
+        "Vulkan custom quadratic output: {:?}",
+        vulkan_custom_result.output
+    );
+    println!(
+        "Vulkan custom quadratic input gradient: {:?}",
+        vulkan_custom_result.input_gradient
+    );
+    println!(
+        "CPU/Vulkan custom operation parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
     println!("{timing_report}");
 
@@ -321,6 +335,18 @@ fn check_training_parity(
         &vulkan.weight_gradient,
     )?;
     check_values("bias gradient", &cpu.bias_gradient, &vulkan.bias_gradient)
+}
+
+fn check_custom_op_parity(
+    cpu: &CustomOpProbeResult,
+    vulkan: &CustomOpProbeResult,
+) -> Result<(), String> {
+    check_values("custom operation output", &cpu.output, &vulkan.output)?;
+    check_values(
+        "custom operation input gradient",
+        &cpu.input_gradient,
+        &vulkan.input_gradient,
+    )
 }
 
 fn check_values(name: &str, cpu: &[f32], vulkan: &[f32]) -> Result<(), String> {

@@ -2,6 +2,8 @@
 
 //! Small, backend-independent checks for Vulkan AI research workflows.
 
+mod ops;
+
 use burn::{
     module::Param,
     nn::{
@@ -11,6 +13,8 @@ use burn::{
     tensor::{Tensor, backend::AutodiffBackend},
 };
 use std::{error::Error, fmt};
+
+pub use ops::{CustomOpsBackend, quadratic};
 
 /// Values produced by a forward pass and its gradient calculation.
 #[derive(Debug, PartialEq)]
@@ -34,6 +38,15 @@ pub struct TrainingProbeResult {
     pub bias_gradient: Vec<f32>,
 }
 
+/// Values produced by the custom quadratic operation and its backward rule.
+#[derive(Debug, PartialEq)]
+pub struct CustomOpProbeResult {
+    /// Result of applying `x² + x` element-wise.
+    pub output: Vec<f32>,
+    /// Gradient of the summed output with respect to the input.
+    pub input_gradient: Vec<f32>,
+}
+
 /// Error returned when a backend cannot complete the probe.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProbeError {
@@ -41,6 +54,8 @@ pub enum ProbeError {
     MissingGradient,
     /// The autodiff backend did not return the requested bias gradient.
     MissingBiasGradient,
+    /// The autodiff backend did not return the custom operation's input gradient.
+    MissingInputGradient,
     /// Tensor data could not be converted to the expected `f32` values.
     DataConversion(String),
     /// The backend could not synchronize the training workload.
@@ -54,6 +69,9 @@ impl fmt::Display for ProbeError {
             Self::MissingBiasGradient => {
                 formatter.write_str("the required bias gradient is missing")
             }
+            Self::MissingInputGradient => {
+                formatter.write_str("the custom operation input gradient is missing")
+            }
             Self::DataConversion(message) => {
                 write!(formatter, "could not read probe tensor data: {message}")
             }
@@ -65,6 +83,38 @@ impl fmt::Display for ProbeError {
             }
         }
     }
+}
+
+/// Run the custom quadratic operation and its explicit backward rule.
+///
+/// The fixed input exercises negative, zero, and positive derivatives while
+/// remaining directly comparable across backends.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] if the backend omits the input gradient or if tensor
+/// data cannot be converted to `f32` values.
+pub fn run_custom_op_probe<B>(device: &B::Device) -> Result<CustomOpProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32> + CustomOpsBackend,
+{
+    let input = Tensor::<B, 1>::from_floats([-2.0, -0.5, 0.0, 1.5], device).require_grad();
+    let output = quadratic(input.clone());
+    let gradients = output.clone().sum().backward();
+    let input_gradient = input
+        .grad(&gradients)
+        .ok_or(ProbeError::MissingInputGradient)?;
+
+    Ok(CustomOpProbeResult {
+        output: output
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
+        input_gradient: input_gradient
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ProbeError::DataConversion(error.to_string()))?,
+    })
 }
 
 impl Error for ProbeError {}
@@ -217,8 +267,8 @@ mod tests {
     use burn::backend::{Autodiff, Flex, flex::FlexDevice};
 
     use super::{
-        ProbeResult, TrainingProbeResult, run_autodiff_probe, run_synchronized_training_workload,
-        run_training_probe,
+        CustomOpProbeResult, ProbeResult, TrainingProbeResult, run_autodiff_probe,
+        run_custom_op_probe, run_synchronized_training_workload, run_training_probe,
     };
 
     #[test]
@@ -252,6 +302,21 @@ mod tests {
         assert_values_close(&[result.loss], &[expected.loss]);
         assert_values_close(&result.weight_gradient, &expected.weight_gradient);
         assert_values_close(&result.bias_gradient, &expected.bias_gradient);
+    }
+
+    #[test]
+    fn computes_custom_quadratic_output_and_gradient() {
+        type Backend = Autodiff<Flex>;
+
+        let result = run_custom_op_probe::<Backend>(&FlexDevice).unwrap();
+
+        assert_eq!(
+            result,
+            CustomOpProbeResult {
+                output: vec![2.0, -0.25, 0.0, 3.75],
+                input_gradient: vec![-3.0, 0.0, 1.0, 4.0],
+            }
+        );
     }
 
     #[test]
