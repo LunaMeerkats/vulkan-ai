@@ -21,5 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   summary statistics, runtime settings, and optional Burn fusion.
 - Backend-generic custom `x² + x` operation with an explicit `2x + 1`
   backward rule and CPU/Vulkan parity coverage.
+- Architecture decision record defining the staged boundary between Burn
+  primitives, CubeCL custom kernels, and direct Vulkan interoperability.
 
 [Unreleased]: https://github.com/LunaMeerkats/vulkan-ai/commits/main
