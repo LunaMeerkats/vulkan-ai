@@ -11,6 +11,15 @@ well-tested changes are especially valuable.
 4. Add or update tests and documentation with the implementation.
 5. Open a pull request and complete the provided checklist.
 
+## Backend extensions
+
+Follow [ADR 0002](docs/adr/0002-extension-boundary.md) when adding an operation:
+start with Burn primitives, use CubeCL for a custom kernel, and keep a portable
+reference implementation. Direct WGPU or Vulkan interoperability requires a
+concrete capability or measured performance gap, a design issue, and a
+follow-up ADR covering resource ownership, synchronization, safety, fallback,
+and validation.
+
 ## Local checks
 
 Run the checks used by continuous integration:

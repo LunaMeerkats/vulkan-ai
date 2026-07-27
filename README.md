@@ -10,7 +10,10 @@ work on custom operations, profiling, and Vulkan interoperability.
 
 The rationale for building on Burn rather than starting with a raw Vulkan
 abstraction is recorded in
-[ADR 0001](docs/adr/0001-burn-vulkan-backend.md).
+[ADR 0001](docs/adr/0001-burn-vulkan-backend.md). The extension boundary is
+recorded in [ADR 0002](docs/adr/0002-extension-boundary.md): prefer Burn
+primitives, use CubeCL for custom kernels, and require measured evidence plus a
+separate design before introducing direct Vulkan interoperability.
 
 ## Status
 
@@ -66,8 +69,8 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Document the boundary between Burn/CubeCL extensions and direct Vulkan
-  interoperability in an architecture decision record.
+- Replace the composed custom quadratic forward path with a CubeCL kernel and
+  benchmark it against the Burn reference while retaining autodiff parity.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.
