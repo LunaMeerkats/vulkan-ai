@@ -88,9 +88,10 @@ second tensor, autodiff, optimizer, or training framework alongside Burn.
 
 ## Consequences
 
-- The next custom-kernel experiment has a defined path: replace the composed
-  quadratic forward implementation with CubeCL while retaining its Burn
-  reference and explicit backward rule.
+- The first custom-kernel experiment follows this path: the quadratic forward
+  implementation uses CubeCL on Vulkan while retaining its Burn reference,
+  fusion-stream integration, explicit backward rule, parity coverage, and
+  synchronized comparative benchmark.
 - Most code remains portable across CPU and Vulkan, and the current GPU-free CI
   strategy remains viable.
 - CubeCL version changes may require kernel API maintenance, so custom kernels

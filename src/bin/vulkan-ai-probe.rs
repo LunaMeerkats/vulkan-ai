@@ -5,12 +5,14 @@ use burn::backend::{
     flex::FlexDevice,
     wgpu::{RuntimeOptions, WgpuDevice, graphics::Vulkan as VulkanGraphics, init_setup},
 };
+use burn::tensor::{Tensor, backend::Backend};
 use std::{
     fmt,
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, ProbeError, TrainingProbeResult, run_autodiff_probe, run_custom_op_probe,
+    CustomOpProbeResult, CustomOpsBackend, ProbeError, TrainingProbeResult, quadratic,
+    quadratic_reference, run_autodiff_probe, run_custom_op_probe,
     run_synchronized_training_workload, run_training_probe,
 };
 
@@ -20,6 +22,9 @@ const TIMING_WARMUP_ITERATIONS: usize = 5;
 const TIMING_MEASURED_ITERATIONS: usize = 20;
 const TIMING_SCOPE: &str = "allocation+forward+mse+backward; host readback excluded";
 const TIMING_SYNCHRONIZATION: &str = "Burn Backend::sync after every iteration";
+const CUSTOM_TIMING_ELEMENTS: usize = 1_048_576;
+const CUSTOM_TIMING_SCOPE: &str =
+    "quadratic forward over 1048576 f32 elements; input allocation and host readback excluded";
 
 #[derive(Debug, PartialEq, Eq)]
 struct VulkanAdapterReport {
@@ -58,6 +63,18 @@ struct VulkanTimingReport {
     warmup_iterations: usize,
     samples_ms: Vec<f64>,
     summary: TimingSummary,
+}
+
+#[derive(Debug, PartialEq)]
+struct VulkanCustomTimingReport {
+    build_profile: &'static str,
+    fusion: &'static str,
+    elements: usize,
+    warmup_iterations: usize,
+    kernel_samples_ms: Vec<f64>,
+    kernel_summary: TimingSummary,
+    reference_samples_ms: Vec<f64>,
+    reference_summary: TimingSummary,
 }
 
 impl fmt::Display for VulkanAdapterReport {
@@ -174,6 +191,68 @@ impl fmt::Display for VulkanTimingReport {
     }
 }
 
+impl fmt::Display for VulkanCustomTimingReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "Vulkan custom quadratic benchmark:")?;
+        writeln!(formatter, "  Build profile: {}", self.build_profile)?;
+        writeln!(formatter, "  Fusion: {}", self.fusion)?;
+        writeln!(formatter, "  Elements: {}", self.elements)?;
+        writeln!(formatter, "  Workload: {CUSTOM_TIMING_SCOPE}")?;
+        writeln!(
+            formatter,
+            "  Warm-up iterations per implementation: {}",
+            self.warmup_iterations
+        )?;
+        writeln!(
+            formatter,
+            "  Measured iterations per implementation: {}",
+            self.kernel_samples_ms.len()
+        )?;
+        writeln!(formatter, "  Synchronization: {TIMING_SYNCHRONIZATION}")?;
+        writeln!(
+            formatter,
+            "  CubeCL kernel median: {:.6} ms",
+            self.kernel_summary.median
+        )?;
+        writeln!(
+            formatter,
+            "  Burn reference median: {:.6} ms",
+            self.reference_summary.median
+        )?;
+        writeln!(
+            formatter,
+            "  Reference/kernel median ratio: {:.3}x",
+            self.reference_summary.median / self.kernel_summary.median
+        )?;
+        write!(
+            formatter,
+            "Vulkan custom timing JSON: {{\"schema\":1,\"build_profile\":\"{}\",\"fusion\":\"{}\",\"elements\":{},\"scope\":\"{CUSTOM_TIMING_SCOPE}\",\"warmup_iterations\":{},\"synchronization\":\"{TIMING_SYNCHRONIZATION}\",\"kernel_samples_ms\":[",
+            self.build_profile, self.fusion, self.elements, self.warmup_iterations
+        )?;
+        write_samples(formatter, &self.kernel_samples_ms)?;
+        formatter.write_str("],\"reference_samples_ms\":[")?;
+        write_samples(formatter, &self.reference_samples_ms)?;
+        write!(
+            formatter,
+            "],\"kernel_median_ms\":{:.6},\"reference_median_ms\":{:.6},\"reference_kernel_median_ratio\":{:.6}}}",
+            self.kernel_summary.median,
+            self.reference_summary.median,
+            self.reference_summary.median / self.kernel_summary.median
+        )
+    }
+}
+
+fn write_samples(formatter: &mut fmt::Formatter<'_>, samples: &[f64]) -> fmt::Result {
+    for (index, sample) in samples.iter().enumerate() {
+        if index > 0 {
+            formatter.write_str(",")?;
+        }
+        write!(formatter, "{sample:.6}")?;
+    }
+
+    Ok(())
+}
+
 fn value_or_unavailable(value: &str) -> &str {
     if value.is_empty() {
         "unavailable"
@@ -217,7 +296,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_buffer_size: device_limits.max_buffer_size,
     };
 
-    let timing_report = measure_training_timing::<VulkanAutodiffBackend>(&device, tasks_max)?;
     let result = run_autodiff_probe::<VulkanAutodiffBackend>(&device)?;
     let cpu_training_result = run_training_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_training_result = run_training_probe::<VulkanAutodiffBackend>(&device)?;
@@ -225,6 +303,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_custom_result = run_custom_op_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_custom_result = run_custom_op_probe::<VulkanAutodiffBackend>(&device)?;
     check_custom_op_parity(&cpu_custom_result, &vulkan_custom_result)?;
+    let timing_report = measure_training_timing::<VulkanAutodiffBackend>(&device, tasks_max)?;
+    let custom_timing_report = measure_custom_op_timing::<VulkanBackend>(&device)?;
 
     println!("{adapter_report}");
     println!("Vulkan forward output: {:?}", result.output);
@@ -257,8 +337,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "CPU/Vulkan custom operation parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
     println!("{timing_report}");
+    println!("{custom_timing_report}");
 
     Ok(())
+}
+
+fn measure_custom_op_timing<B>(device: &B::Device) -> Result<VulkanCustomTimingReport, ProbeError>
+where
+    B: Backend<FloatElem = f32> + CustomOpsBackend,
+{
+    let input = Tensor::<B, 1>::ones([CUSTOM_TIMING_ELEMENTS], device);
+    B::sync(device).map_err(|error| ProbeError::Synchronization(error.to_string()))?;
+
+    for _ in 0..TIMING_WARMUP_ITERATIONS {
+        measure_quadratic_iteration(input.clone(), true, device)?;
+        measure_quadratic_iteration(input.clone(), false, device)?;
+    }
+
+    let mut kernel_samples = Vec::with_capacity(TIMING_MEASURED_ITERATIONS);
+    let mut reference_samples = Vec::with_capacity(TIMING_MEASURED_ITERATIONS);
+    for iteration in 0..TIMING_MEASURED_ITERATIONS {
+        if iteration.is_multiple_of(2) {
+            kernel_samples.push(measure_quadratic_iteration(input.clone(), true, device)?);
+            reference_samples.push(measure_quadratic_iteration(input.clone(), false, device)?);
+        } else {
+            reference_samples.push(measure_quadratic_iteration(input.clone(), false, device)?);
+            kernel_samples.push(measure_quadratic_iteration(input.clone(), true, device)?);
+        }
+    }
+
+    let (kernel_samples_ms, kernel_summary) = summarize_samples(&kernel_samples);
+    let (reference_samples_ms, reference_summary) = summarize_samples(&reference_samples);
+
+    Ok(VulkanCustomTimingReport {
+        build_profile: build_profile(),
+        fusion: fusion_state(),
+        elements: CUSTOM_TIMING_ELEMENTS,
+        warmup_iterations: TIMING_WARMUP_ITERATIONS,
+        kernel_samples_ms,
+        kernel_summary,
+        reference_samples_ms,
+        reference_summary,
+    })
+}
+
+fn measure_quadratic_iteration<B>(
+    input: Tensor<B, 1>,
+    use_kernel: bool,
+    device: &B::Device,
+) -> Result<Duration, ProbeError>
+where
+    B: Backend<FloatElem = f32> + CustomOpsBackend,
+{
+    let start = Instant::now();
+    let output = if use_kernel {
+        quadratic(input)
+    } else {
+        quadratic_reference(input)
+    };
+    B::sync(device).map_err(|error| ProbeError::Synchronization(error.to_string()))?;
+    std::hint::black_box(output);
+
+    Ok(start.elapsed())
 }
 
 fn measure_training_timing<B>(
@@ -283,6 +423,19 @@ where
 }
 
 fn timing_report(samples: &[Duration], tasks_max: usize) -> VulkanTimingReport {
+    let (samples_ms, summary) = summarize_samples(samples);
+
+    VulkanTimingReport {
+        build_profile: build_profile(),
+        fusion: fusion_state(),
+        tasks_max,
+        warmup_iterations: TIMING_WARMUP_ITERATIONS,
+        samples_ms,
+        summary,
+    }
+}
+
+fn summarize_samples(samples: &[Duration]) -> (Vec<f64>, TimingSummary) {
     assert!(!samples.is_empty(), "timing requires at least one sample");
 
     let samples_ms = samples
@@ -298,28 +451,30 @@ fn timing_report(samples: &[Duration], tasks_max: usize) -> VulkanTimingReport {
         sorted[middle]
     };
     let p95_index = (sorted.len() * 95).div_ceil(100) - 1;
-    let summary = TimingSummary {
-        min: sorted[0],
-        median,
-        p95: sorted[p95_index],
-        max: sorted[sorted.len() - 1],
-    };
-
-    VulkanTimingReport {
-        build_profile: if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
-        fusion: if cfg!(feature = "vulkan-fusion") {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        tasks_max,
-        warmup_iterations: TIMING_WARMUP_ITERATIONS,
+    (
         samples_ms,
-        summary,
+        TimingSummary {
+            min: sorted[0],
+            median,
+            p95: sorted[p95_index],
+            max: sorted[sorted.len() - 1],
+        },
+    )
+}
+
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+fn fusion_state() -> &'static str {
+    if cfg!(feature = "vulkan-fusion") {
+        "enabled"
+    } else {
+        "disabled"
     }
 }
 
@@ -381,8 +536,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        TIMING_SCOPE, TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult,
-        VulkanAdapterReport, check_training_parity, timing_report,
+        CUSTOM_TIMING_SCOPE, TIMING_SCOPE, TIMING_SYNCHRONIZATION, TimingSummary,
+        TrainingProbeResult, VulkanAdapterReport, VulkanCustomTimingReport, check_training_parity,
+        timing_report,
     };
 
     #[test]
@@ -492,6 +648,40 @@ Vulkan compute capabilities:
         assert!(formatted.contains(&format!("  Synchronization: {TIMING_SYNCHRONIZATION}")));
         assert!(formatted.contains(
             "\"samples_ms\":[4.000000,1.000000,3.000000,2.000000],\"min_ms\":1.000000,\"median_ms\":2.500000,\"p95_ms\":4.000000,\"max_ms\":4.000000"
+        ));
+    }
+
+    #[test]
+    fn formats_custom_kernel_benchmark() {
+        let report = VulkanCustomTimingReport {
+            build_profile: "release",
+            fusion: "disabled",
+            elements: 1_048_576,
+            warmup_iterations: 5,
+            kernel_samples_ms: vec![1.0, 2.0],
+            kernel_summary: TimingSummary {
+                min: 1.0,
+                median: 1.5,
+                p95: 2.0,
+                max: 2.0,
+            },
+            reference_samples_ms: vec![3.0, 4.0],
+            reference_summary: TimingSummary {
+                min: 3.0,
+                median: 3.5,
+                p95: 4.0,
+                max: 4.0,
+            },
+        };
+
+        let formatted = report.to_string();
+
+        assert!(formatted.contains(&format!("  Workload: {CUSTOM_TIMING_SCOPE}")));
+        assert!(formatted.contains("  CubeCL kernel median: 1.500000 ms"));
+        assert!(formatted.contains("  Burn reference median: 3.500000 ms"));
+        assert!(formatted.contains("  Reference/kernel median ratio: 2.333x"));
+        assert!(formatted.contains(
+            "\"kernel_samples_ms\":[1.000000,2.000000],\"reference_samples_ms\":[3.000000,4.000000]"
         ));
     }
 

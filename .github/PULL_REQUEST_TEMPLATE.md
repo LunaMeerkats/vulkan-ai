@@ -10,4 +10,5 @@ Describe what changed and why.
 - [ ] `cargo test --features vulkan --bin vulkan-ai-probe`
 - [ ] `cargo test --features vulkan-fusion --bin vulkan-ai-probe`
 - [ ] Vulkan-specific behavior was tested or clearly marked as compile-only
+- [ ] Custom kernels retain a reference path, parity coverage, and a synchronized benchmark
 - [ ] `CHANGELOG.md` was updated when the change is user-visible

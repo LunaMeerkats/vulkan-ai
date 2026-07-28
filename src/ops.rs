@@ -23,8 +23,10 @@ use burn::backend::Flex;
 /// decorator overrides it to register one graph node with an explicit backward
 /// rule.
 pub trait CustomOpsBackend: BurnBackend {
-    /// Calculate `x² + x` without adding autodiff graph nodes for its component
-    /// operations.
+    /// Calculate `x² + x` without adding autodiff graph nodes for its component operations.
+    ///
+    /// Portable backends use the Burn reference implementation. `CubeCL` backends
+    /// override this method with a custom element-wise kernel.
     fn quadratic(input: FloatTensor<Self>) -> FloatTensor<Self> {
         quadratic_primitive::<Self>(input)
     }
@@ -33,9 +35,6 @@ pub trait CustomOpsBackend: BurnBackend {
 #[cfg(feature = "cpu")]
 impl CustomOpsBackend for Flex {}
 
-#[cfg(feature = "vulkan")]
-impl CustomOpsBackend for burn::backend::Vulkan {}
-
 /// Apply the custom element-wise quadratic operation `x² + x`.
 pub fn quadratic<B: CustomOpsBackend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
     let output = B::quadratic(input.into_primitive().tensor());
@@ -43,9 +42,146 @@ pub fn quadratic<B: CustomOpsBackend, const D: usize>(input: Tensor<B, D>) -> Te
     Tensor::from_primitive(TensorPrimitive::Float(output))
 }
 
+/// Apply the portable Burn reference for the element-wise operation `x² + x`.
+pub fn quadratic_reference<B: BurnBackend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
+    let output = quadratic_primitive::<B>(input.into_primitive().tensor());
+
+    Tensor::from_primitive(TensorPrimitive::Float(output))
+}
+
 fn quadratic_primitive<B: BurnBackend>(input: FloatTensor<B>) -> FloatTensor<B> {
     let squared = B::float_mul(input.clone(), input.clone());
     B::float_add(squared, input)
+}
+
+#[cfg(feature = "vulkan")]
+mod cubecl_forward {
+    use super::{CustomOpsBackend, quadratic_primitive};
+    use burn::{
+        backend::wgpu::{
+            BoolElement, CubeBackend, CubeTensor, FloatElement, IntElement, WgpuRuntime,
+        },
+        tensor::ops::FloatTensor,
+    };
+    use burn_cubecl::kernel::into_contiguous;
+    use cubecl::{calculate_cube_count_elemwise, cube, prelude::*};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[cube(launch)]
+    fn quadratic_kernel<F: Float>(input: &Tensor<F>, output: &mut Tensor<F>) {
+        if ABSOLUTE_POS >= output.len() {
+            terminate!();
+        }
+
+        let value = input[ABSOLUTE_POS];
+        output[ABSOLUTE_POS] = value * value + value;
+    }
+
+    impl<F, I, BT> CustomOpsBackend for CubeBackend<WgpuRuntime, F, I, BT>
+    where
+        F: FloatElement,
+        I: IntElement,
+        BT: BoolElement,
+    {
+        fn quadratic(input: FloatTensor<Self>) -> FloatTensor<Self> {
+            if input.dtype != F::dtype() {
+                return quadratic_primitive::<Self>(input);
+            }
+            if input.meta.num_elements() == 0 {
+                return input;
+            }
+
+            let input = into_contiguous(input);
+            let client = input.client.clone();
+            let num_elements = input.meta.num_elements();
+            let cube_dim = CubeDim::new(&client, num_elements);
+            let cube_count = calculate_cube_count_elemwise(&client, num_elements, cube_dim);
+            let output = CubeTensor::new_contiguous(
+                client.clone(),
+                input.device.clone(),
+                input.meta.shape().clone(),
+                client.empty(num_elements * input.dtype.size()),
+                input.dtype,
+            );
+
+            quadratic_kernel::launch::<F, WgpuRuntime>(
+                &client,
+                cube_count,
+                cube_dim,
+                input.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+            );
+
+            output
+        }
+    }
+}
+
+#[cfg(feature = "vulkan-fusion")]
+mod fusion_forward {
+    use super::CustomOpsBackend;
+    use burn::tensor::ops::FloatTensor;
+    use burn_fusion::{
+        Fusion, FusionBackend, FusionRuntime,
+        stream::{Operation, OperationStreams},
+    };
+    use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
+    use std::marker::PhantomData;
+
+    #[derive(Debug)]
+    struct QuadraticOperation<B> {
+        description: CustomOpIr,
+        backend: PhantomData<B>,
+    }
+
+    impl<B> QuadraticOperation<B> {
+        fn new(description: CustomOpIr) -> Self {
+            Self {
+                description,
+                backend: PhantomData,
+            }
+        }
+    }
+
+    impl<B> Operation<B::FusionRuntime> for QuadraticOperation<B>
+    where
+        B: FusionBackend + CustomOpsBackend,
+    {
+        fn execute(
+            &self,
+            handles: &mut HandleContainer<<B::FusionRuntime as FusionRuntime>::FusionHandle>,
+        ) {
+            let ([input], [output]) = self.description.as_fixed();
+            let input = handles.get_float_tensor::<B>(input);
+            let output_tensor = B::quadratic(input);
+
+            handles.register_float_tensor::<B>(&output.id, output_tensor);
+        }
+    }
+
+    impl<B> CustomOpsBackend for Fusion<B>
+    where
+        B: FusionBackend + CustomOpsBackend,
+    {
+        fn quadratic(input: FloatTensor<Self>) -> FloatTensor<Self> {
+            let client = input.client.clone();
+            let streams = OperationStreams::with_inputs([&input]);
+            let output = TensorIr::uninit(
+                client.create_empty_handle(),
+                input.shape.clone(),
+                input.dtype,
+            );
+            let description = CustomOpIr::new("vulkan_ai_quadratic", &[input.into_ir()], &[output]);
+
+            client
+                .register(
+                    streams,
+                    OperationIr::Custom(description.clone()),
+                    QuadraticOperation::<B>::new(description),
+                )
+                .output()
+        }
+    }
 }
 
 #[derive(Debug)]
