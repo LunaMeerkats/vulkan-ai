@@ -23,5 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backward rule and CPU/Vulkan parity coverage.
 - Architecture decision record defining the staged boundary between Burn
   primitives, CubeCL custom kernels, and direct Vulkan interoperability.
+- CubeCL forward kernel and fusion-stream integration for the custom quadratic
+  operation, with a portable Burn reference, non-contiguous layout parity, and
+  synchronized kernel-versus-reference benchmark reporting.
 
 [Unreleased]: https://github.com/LunaMeerkats/vulkan-ai/commits/main

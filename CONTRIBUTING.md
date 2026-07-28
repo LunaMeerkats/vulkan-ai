@@ -20,6 +20,14 @@ concrete capability or measured performance gap, a design issue, and a
 follow-up ADR covering resource ownership, synchronization, safety, fallback,
 and validation.
 
+The quadratic example demonstrates the expected shape: a backend trait, a
+portable Burn reference, a CubeCL implementation for `CubeBackend`, a custom
+fusion-stream registration, and an explicit Burn autodiff rule. Its current
+kernel supports `f32` tensors of any rank and shape; non-contiguous inputs are
+copied to contiguous storage before dispatch, empty tensors are returned
+without dispatch, and other floating-point storage types fall back to the Burn
+reference.
+
 ## Local checks
 
 Run the checks used by continuous integration:
@@ -38,6 +46,11 @@ driver and compares its training and custom-operation results with the CPU
 backend. Use
 `cargo run --release --features vulkan` and repeat with `vulkan-fusion` when
 changing timing, fusion, or synchronization behavior.
+
+Custom-kernel changes must run both release commands. The probe benchmarks the
+CubeCL quadratic path against its Burn reference with synchronized,
+alternating-order samples and verifies the custom forward and backward results
+on a non-contiguous input.
 
 ## Compatibility and releases
 

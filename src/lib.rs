@@ -14,7 +14,7 @@ use burn::{
 };
 use std::{error::Error, fmt};
 
-pub use ops::{CustomOpsBackend, quadratic};
+pub use ops::{CustomOpsBackend, quadratic, quadratic_reference};
 
 /// Values produced by a forward pass and its gradient calculation.
 #[derive(Debug, PartialEq)]
@@ -58,7 +58,7 @@ pub enum ProbeError {
     MissingInputGradient,
     /// Tensor data could not be converted to the expected `f32` values.
     DataConversion(String),
-    /// The backend could not synchronize the training workload.
+    /// The backend could not synchronize a measured workload.
     Synchronization(String),
 }
 
@@ -78,7 +78,7 @@ impl fmt::Display for ProbeError {
             Self::Synchronization(message) => {
                 write!(
                     formatter,
-                    "could not synchronize the training workload: {message}"
+                    "could not synchronize the backend workload: {message}"
                 )
             }
         }
@@ -87,8 +87,9 @@ impl fmt::Display for ProbeError {
 
 /// Run the custom quadratic operation and its explicit backward rule.
 ///
-/// The fixed input exercises negative, zero, and positive derivatives while
-/// remaining directly comparable across backends.
+/// The fixed transposed input exercises negative, zero, and positive
+/// derivatives plus a non-contiguous two-dimensional layout while remaining
+/// directly comparable across backends.
 ///
 /// # Errors
 ///
@@ -98,7 +99,9 @@ pub fn run_custom_op_probe<B>(device: &B::Device) -> Result<CustomOpProbeResult,
 where
     B: AutodiffBackend<FloatElem = f32> + CustomOpsBackend,
 {
-    let input = Tensor::<B, 1>::from_floats([-2.0, -0.5, 0.0, 1.5], device).require_grad();
+    let input = Tensor::<B, 2>::from_floats([[-2.0, 0.0], [-0.5, 1.5]], device)
+        .swap_dims(0, 1)
+        .require_grad();
     let output = quadratic(input.clone());
     let gradients = output.clone().sum().backward();
     let input_gradient = input
@@ -264,11 +267,15 @@ where
 
 #[cfg(all(test, feature = "cpu"))]
 mod tests {
-    use burn::backend::{Autodiff, Flex, flex::FlexDevice};
+    use burn::{
+        backend::{Autodiff, Flex, flex::FlexDevice},
+        tensor::Tensor,
+    };
 
     use super::{
-        CustomOpProbeResult, ProbeResult, TrainingProbeResult, run_autodiff_probe,
-        run_custom_op_probe, run_synchronized_training_workload, run_training_probe,
+        CustomOpProbeResult, ProbeResult, TrainingProbeResult, quadratic_reference,
+        run_autodiff_probe, run_custom_op_probe, run_synchronized_training_workload,
+        run_training_probe,
     };
 
     #[test]
@@ -317,6 +324,19 @@ mod tests {
                 input_gradient: vec![-3.0, 0.0, 1.0, 4.0],
             }
         );
+    }
+
+    #[test]
+    fn computes_portable_quadratic_reference() {
+        type Backend = Flex;
+
+        let input = Tensor::<Backend, 1>::from_floats([-2.0, -0.5, 0.0, 1.5], &FlexDevice);
+        let output = quadratic_reference(input)
+            .into_data()
+            .into_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(output, vec![2.0, -0.25, 0.0, 3.75]);
     }
 
     #[test]

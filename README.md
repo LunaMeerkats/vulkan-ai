@@ -12,8 +12,10 @@ The rationale for building on Burn rather than starting with a raw Vulkan
 abstraction is recorded in
 [ADR 0001](docs/adr/0001-burn-vulkan-backend.md). The extension boundary is
 recorded in [ADR 0002](docs/adr/0002-extension-boundary.md): prefer Burn
-primitives, use CubeCL for custom kernels, and require measured evidence plus a
-separate design before introducing direct Vulkan interoperability.
+primitives, use CubeCL for custom kernels, and require measured evidence plus
+a separate design before introducing direct Vulkan interoperability. The first
+custom forward kernel follows that boundary: Vulkan dispatches `x² + x` through
+CubeCL while Flex retains the portable Burn reference.
 
 ## Status
 
@@ -43,7 +45,10 @@ effective compute and buffer limits. It then prints the calculation results
 and fails if the linear model's predictions, loss, or parameter gradients
 differ from the CPU reference beyond an absolute plus relative tolerance of
 `1e-5` each. It also validates a custom element-wise `x² + x` operation and
-its explicitly registered `2x + 1` backward rule on CPU and Vulkan.
+its explicitly registered `2x + 1` backward rule on CPU and Vulkan. The
+probe's Vulkan `f32` forward path is one CubeCL kernel, including under Burn
+fusion; the parity input is a transposed two-dimensional tensor so the probe
+also exercises the documented contiguous-copy path for non-contiguous layouts.
 
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
@@ -60,6 +65,14 @@ The first command measures the unfused backend; the second enables Burn's
 fusion optimizer. Timing output includes a single-line JSON record suitable
 for storing and comparing runs.
 
+Both commands also benchmark the custom CubeCL quadratic kernel against the
+portable Burn `multiply + add` reference over 1,048,576 `f32` elements. The
+fixed protocol uses five warm-ups, 20 synchronized samples per implementation,
+alternates measurement order, and excludes input allocation and host readback.
+The report includes both raw sample series, medians, and the
+reference-to-kernel median ratio. Treat the result as evidence for that device
+and driver, not a general performance claim.
+
 ```text
 Vulkan forward output: [8.0, 18.0]
 Vulkan weight gradient: [4.0, 6.0]
@@ -69,8 +82,9 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Replace the composed custom quadratic forward path with a CubeCL kernel and
-  benchmark it against the Burn reference while retaining autodiff parity.
+- Profile the custom kernel and Burn reference across representative tensor
+  sizes to identify dispatch and allocation crossover points before proposing
+  a more complex kernel or lower-level interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.
