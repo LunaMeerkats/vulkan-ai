@@ -66,12 +66,24 @@ fusion optimizer. Timing output includes a single-line JSON record suitable
 for storing and comparing runs.
 
 Both commands also benchmark the custom CubeCL quadratic kernel against the
-portable Burn `multiply + add` reference over 1,048,576 `f32` elements. The
-fixed protocol uses five warm-ups, 20 synchronized samples per implementation,
-alternates measurement order, and excludes input allocation and host readback.
-The report includes both raw sample series, medians, and the
-reference-to-kernel median ratio. Treat the result as evidence for that device
-and driver, not a general performance claim.
+portable Burn `multiply + add` reference over 1, 256, 4,096, 65,536, and
+1,048,576 `f32` elements. The fixed protocol uses 20 warm-ups and 20
+synchronized samples per implementation and size, alternates measurement
+order, and excludes input allocation and host readback. Wall-clock samples
+include managed output allocation or reuse, dispatch, and synchronization.
+The unfused command also records CubeCL runtime profiles and reports whether
+the runtime used device or system timing; nested runtime profiling is
+intentionally disabled with Burn fusion because it cannot safely wrap a
+Fusion synchronization on the same runtime.
+
+The schema-2 JSON report includes every raw wall-clock and available profile
+sample, medians, and reference-to-kernel ratios. A ratio above `1.0` means the
+custom kernel's median was lower for that measurement scope. Compare the
+profile and wall-clock ratios before attributing a result to kernel execution:
+a fast device profile can still have little end-to-end impact when managed
+allocation, submission, or synchronization dominates. Treat every result as
+evidence for that device, driver, build, and fusion mode, not a general
+performance claim.
 
 ```text
 Vulkan forward output: [8.0, 18.0]
@@ -82,9 +94,10 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Profile the custom kernel and Burn reference across representative tensor
-  sizes to identify dispatch and allocation crossover points before proposing
-  a more complex kernel or lower-level interoperability.
+- Use the size-sweep evidence to test a representative compound element-wise
+  training operation where fusion or batching can amortize managed allocation,
+  submission, and synchronization overhead. The quadratic experiment does not
+  justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

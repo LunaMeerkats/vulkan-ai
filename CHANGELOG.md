@@ -26,5 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CubeCL forward kernel and fusion-stream integration for the custom quadratic
   operation, with a portable Burn reference, non-contiguous layout parity, and
   synchronized kernel-versus-reference benchmark reporting.
+- Reproducible custom-kernel size sweep with raw wall-clock samples, CubeCL
+  device profiles for the unfused backend, and explicit fused-profile
+  limitations for separating execution from managed runtime overhead.
 
 [Unreleased]: https://github.com/LunaMeerkats/vulkan-ai/commits/main

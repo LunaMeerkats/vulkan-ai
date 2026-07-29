@@ -12,7 +12,7 @@ publish = false
 [features]
 default = ["cpu"]
 cpu = ["burn/flex"]
-vulkan = ["burn/vulkan", "dep:burn-cubecl", "dep:cubecl"]
+vulkan = ["burn/vulkan", "dep:burn-cubecl", "dep:cubecl", "dep:futures-lite"]
 vulkan-fusion = ["vulkan", "burn/fusion", "dep:burn-fusion", "dep:burn-ir"]
 
 [dependencies]
@@ -21,6 +21,7 @@ burn-cubecl = { version = "0.21.0", default-features = false, features = ["std"]
 burn-fusion = { version = "0.21.0", optional = true }
 burn-ir = { version = "0.21.0", optional = true }
 cubecl = { version = "0.10.0", default-features = false, optional = true }
+futures-lite = { version = "2.6.1", optional = true }
 
 [[bin]]
 name = "vulkan-ai-probe"

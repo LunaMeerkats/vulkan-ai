@@ -48,9 +48,14 @@ backend. Use
 changing timing, fusion, or synchronization behavior.
 
 Custom-kernel changes must run both release commands. The probe benchmarks the
-CubeCL quadratic path against its Burn reference with synchronized,
-alternating-order samples and verifies the custom forward and backward results
-on a non-contiguous input.
+CubeCL quadratic path against its Burn reference at five representative tensor
+sizes with 20 warm-ups, 20 synchronized alternating-order wall-clock samples,
+and raw JSON output. The unfused run also collects CubeCL runtime profiles so
+device execution can be distinguished from managed allocation, submission,
+and synchronization overhead. Nested CubeCL profiling is intentionally
+disabled for the fused run; its synchronized wall-clock sweep remains
+required. The probe also verifies custom forward and backward results on a
+non-contiguous input.
 
 ## Compatibility and releases
 
