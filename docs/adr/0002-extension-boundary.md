@@ -90,8 +90,11 @@ second tensor, autodiff, optimizer, or training framework alongside Burn.
 
 - The first custom-kernel experiment follows this path: the quadratic forward
   implementation uses CubeCL on Vulkan while retaining its Burn reference,
-  fusion-stream integration, explicit backward rule, parity coverage, and
-  synchronized comparative benchmark.
+  fusion-stream integration, explicit backward rule, parity coverage, and a
+  synchronized size sweep with unfused CubeCL device profiles. On the current
+  Radeon RX 6800 XT evidence, dispatch savings are substantially diluted by
+  managed allocation, submission, and synchronization overhead, so this
+  experiment does not justify direct Vulkan interoperability.
 - Most code remains portable across CPU and Vulkan, and the current GPU-free CI
   strategy remains viable.
 - CubeCL version changes may require kernel API maintenance, so custom kernels

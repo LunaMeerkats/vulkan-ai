@@ -60,6 +60,8 @@ pub enum ProbeError {
     DataConversion(String),
     /// The backend could not synchronize a measured workload.
     Synchronization(String),
+    /// `CubeCL` could not profile a measured workload consistently.
+    Profiling(String),
 }
 
 impl fmt::Display for ProbeError {
@@ -79,6 +81,12 @@ impl fmt::Display for ProbeError {
                 write!(
                     formatter,
                     "could not synchronize the backend workload: {message}"
+                )
+            }
+            Self::Profiling(message) => {
+                write!(
+                    formatter,
+                    "could not profile the backend workload: {message}"
                 )
             }
         }
