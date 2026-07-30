@@ -30,4 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device profiles for the unfused backend, and explicit fused-profile
   limitations for separating execution from managed runtime overhead.
 
+### Fixed
+
+- Custom quadratic autodiff forward execution and checkpoint recomputation now
+  delegate to the backend-specific implementation, so Vulkan training and
+  parity checks exercise the CubeCL kernel instead of the portable reference.
+
 [Unreleased]: https://github.com/LunaMeerkats/vulkan-ai/commits/main
