@@ -17,6 +17,11 @@ use std::marker::PhantomData;
 #[cfg(feature = "cpu")]
 use burn::backend::Flex;
 
+#[cfg(all(feature = "cpu", test))]
+std::thread_local! {
+    static FLEX_QUADRATIC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Backend support for Vulkan AI custom tensor operations.
 ///
 /// Base backends use the default forward implementation. The autodiff
@@ -32,8 +37,18 @@ pub trait CustomOpsBackend: BurnBackend {
     }
 }
 
-#[cfg(feature = "cpu")]
+#[cfg(all(feature = "cpu", not(test)))]
 impl CustomOpsBackend for Flex {}
+
+#[cfg(all(feature = "cpu", test))]
+impl CustomOpsBackend for Flex {
+    fn quadratic(input: FloatTensor<Self>) -> FloatTensor<Self> {
+        // Let the regression test distinguish backend delegation from the
+        // mathematically equivalent portable implementation.
+        FLEX_QUADRATIC_CALLS.with(|calls| calls.set(calls.get() + 1));
+        quadratic_primitive::<Self>(input)
+    }
+}
 
 /// Apply the custom element-wise quadratic operation `x² + x`.
 pub fn quadratic<B: CustomOpsBackend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
@@ -206,12 +221,12 @@ impl<B: CustomOpsBackend> Backward<B, 1> for QuadraticBackward {
 }
 
 #[derive(Debug)]
-struct RetroQuadratic<B: BurnBackend> {
+struct RetroQuadratic<B: CustomOpsBackend> {
     input_id: NodeId,
     backend: PhantomData<B>,
 }
 
-impl<B: BurnBackend> RetroQuadratic<B> {
+impl<B: CustomOpsBackend> RetroQuadratic<B> {
     fn new(input_id: NodeId) -> Self {
         Self {
             input_id,
@@ -220,10 +235,10 @@ impl<B: BurnBackend> RetroQuadratic<B> {
     }
 }
 
-impl<B: BurnBackend> RetroForward for RetroQuadratic<B> {
+impl<B: CustomOpsBackend> RetroForward for RetroQuadratic<B> {
     fn forward(&self, states: &mut BackwardStates, out_node: NodeId) {
         let input = states.get_state::<B::FloatTensorPrimitive>(&self.input_id);
-        states.save(out_node, quadratic_primitive::<B>(input));
+        states.save(out_node, B::quadratic(input));
     }
 }
 
@@ -238,12 +253,33 @@ impl<B: CustomOpsBackend, C: CheckpointStrategy> CustomOpsBackend for Autodiff<B
         {
             OpsKind::Tracked(mut preparation) => {
                 let state = preparation.checkpoint(&input);
-                let output = quadratic_primitive::<B>(input.primitive);
+                let output = B::quadratic(input.primitive);
                 preparation.finish(state, output)
             }
-            OpsKind::UnTracked(preparation) => {
-                preparation.finish(quadratic_primitive::<B>(input.primitive))
-            }
+            OpsKind::UnTracked(preparation) => preparation.finish(B::quadratic(input.primitive)),
         }
+    }
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod tests {
+    use burn::{
+        backend::{Autodiff, Flex, flex::FlexDevice},
+        tensor::Tensor,
+    };
+
+    use super::{FLEX_QUADRATIC_CALLS, quadratic};
+
+    #[test]
+    fn autodiff_forward_delegates_to_the_inner_backend() {
+        type Backend = Autodiff<Flex>;
+
+        FLEX_QUADRATIC_CALLS.with(|calls| calls.set(0));
+        let input =
+            Tensor::<Backend, 1>::from_floats([-2.0, -0.5, 0.0, 1.5], &FlexDevice).require_grad();
+        let output = quadratic(input).into_data().into_vec::<f32>().unwrap();
+
+        assert_eq!(output, vec![2.0, -0.25, 0.0, 3.75]);
+        FLEX_QUADRATIC_CALLS.with(|calls| assert_eq!(calls.get(), 1));
     }
 }
