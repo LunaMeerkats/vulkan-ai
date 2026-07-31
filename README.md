@@ -85,6 +85,19 @@ allocation, submission, or synchronization dominates. Treat every result as
 evidence for that device, driver, build, and fusion mode, not a general
 performance claim.
 
+The release commands also run a second balanced size sweep through autodiff.
+It compares the custom quadratic forward plus its explicit backward rule with
+the portable Burn primitive composition and generated backward graph. Each
+sample starts from a preallocated input, calculates a mean-squared output loss,
+runs the input-gradient backward pass, and synchronizes without host readback.
+The report includes raw wall-clock samples and median reference-to-custom ratios
+for the same five tensor sizes. Run both feature combinations because fusion
+can change the relative cost of the portable graph and the custom operation.
+On an AMD Radeon RX 6800 XT with driver 26.7.1, unfused ratios ranged from
+`1.002x` to `1.036x`; fused ratios ranged from `0.986x` to `1.029x`. That is
+effectively near parity for this compound workload, not a general custom-kernel
+performance claim.
+
 ```text
 Vulkan forward output: [8.0, 18.0]
 Vulkan weight gradient: [4.0, 6.0]
@@ -94,10 +107,9 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Use the size-sweep evidence to test a representative compound element-wise
-  training operation where fusion or batching can amortize managed allocation,
-  submission, and synchronization overhead. The quadratic experiment does not
-  justify lower-level Vulkan interoperability.
+- Add a deterministic multi-step optimizer probe that verifies loss reduction
+  and CPU/Vulkan parameter parity before expanding to larger models. The
+  quadratic experiments do not justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

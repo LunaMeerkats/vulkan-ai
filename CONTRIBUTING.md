@@ -57,6 +57,13 @@ disabled for the fused run; its synchronized wall-clock sweep remains
 required. The probe also verifies custom forward and backward results on a
 non-contiguous input.
 
+The same release commands also compare the custom quadratic forward and
+explicit backward rule with the portable Burn autodiff graph at those five
+sizes. This second sweep uses preallocated inputs, a mean-squared output loss,
+balanced ordering, 20 warm-ups, 20 synchronized samples, and no host readback.
+Report both unfused and fused results when changing the operation or its
+autodiff integration.
+
 ## Compatibility and releases
 
 - `main` must remain releasable.

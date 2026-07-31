@@ -95,6 +95,12 @@ second tensor, autodiff, optimizer, or training framework alongside Burn.
   Radeon RX 6800 XT evidence, dispatch savings are substantially diluted by
   managed allocation, submission, and synchronization overhead, so this
   experiment does not justify direct Vulkan interoperability.
+- A follow-up compound benchmark measures the custom forward plus explicit
+  backward against the portable Burn autodiff graph through a mean-squared loss.
+  On the same Radeon RX 6800 XT with driver 26.7.1, reference-to-custom medians
+  span `1.002x` to `1.036x` without fusion and `0.986x` to `1.029x` with fusion
+  across 1 to 1,048,576 elements. The near-parity result reinforces the decision
+  to evaluate model-level training next instead of escalating the kernel layer.
 - Most code remains portable across CPU and Vulkan, and the current GPU-free CI
   strategy remains viable.
 - CubeCL version changes may require kernel API maintenance, so custom kernels
