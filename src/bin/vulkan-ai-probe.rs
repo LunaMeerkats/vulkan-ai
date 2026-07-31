@@ -14,9 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, CustomOpsBackend, ProbeError, TrainingProbeResult, quadratic,
-    quadratic_reference, run_autodiff_probe, run_custom_op_probe,
-    run_synchronized_training_workload, run_training_probe,
+    CustomOpProbeResult, CustomOpsBackend, ProbeError, QuadraticTrainingPath, TrainingProbeResult,
+    quadratic, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+    run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
+    run_training_probe,
 };
 
 const PARITY_ABSOLUTE_TOLERANCE: f32 = 1.0e-5;
@@ -30,6 +31,8 @@ const CUSTOM_TIMING_WARMUP_ITERATIONS: usize = 20;
 const CUSTOM_TIMING_SCOPE: &str = "quadratic forward over preallocated f32 input; output allocation/reuse, dispatch, and synchronization included; host readback excluded";
 const CUSTOM_PROFILE_SCOPE: &str =
     "CubeCL runtime profile around forward and synchronization; host readback excluded";
+const CUSTOM_TRAINING_WARMUP_ITERATIONS: usize = 20;
+const CUSTOM_TRAINING_SCOPE: &str = "quadratic forward + mean-squared output loss + input-gradient backward over preallocated f32 input; graph/output allocation, dispatch, reduction, and synchronization included; host readback excluded";
 
 #[derive(Debug, PartialEq, Eq)]
 struct VulkanAdapterReport {
@@ -90,6 +93,23 @@ struct CustomTimingMeasurement {
     kernel_profile_summary: Option<TimingSummary>,
     reference_profile_samples_ms: Option<Vec<f64>>,
     reference_profile_summary: Option<TimingSummary>,
+}
+
+#[derive(Debug, PartialEq)]
+struct VulkanCustomTrainingTimingReport {
+    build_profile: &'static str,
+    fusion: &'static str,
+    warmup_iterations: usize,
+    measurements: Vec<CustomTrainingTimingMeasurement>,
+}
+
+#[derive(Debug, PartialEq)]
+struct CustomTrainingTimingMeasurement {
+    elements: usize,
+    custom_samples_ms: Vec<f64>,
+    custom_summary: TimingSummary,
+    reference_samples_ms: Vec<f64>,
+    reference_summary: TimingSummary,
 }
 
 impl fmt::Display for VulkanAdapterReport {
@@ -346,6 +366,78 @@ impl VulkanCustomTimingReport {
     }
 }
 
+impl fmt::Display for VulkanCustomTrainingTimingReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "Vulkan quadratic autodiff size sweep:")?;
+        writeln!(formatter, "  Build profile: {}", self.build_profile)?;
+        writeln!(formatter, "  Fusion: {}", self.fusion)?;
+        write!(formatter, "  Elements: ")?;
+        for (index, measurement) in self.measurements.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{}", measurement.elements)?;
+        }
+        formatter.write_str("\n")?;
+        writeln!(formatter, "  Wall-clock scope: {CUSTOM_TRAINING_SCOPE}")?;
+        writeln!(
+            formatter,
+            "  Warm-up iterations per implementation: {}",
+            self.warmup_iterations
+        )?;
+        writeln!(
+            formatter,
+            "  Measured iterations per implementation: {}",
+            self.measurements
+                .first()
+                .map_or(0, |measurement| measurement.custom_samples_ms.len())
+        )?;
+        writeln!(formatter, "  Synchronization: {TIMING_SYNCHRONIZATION}")?;
+        writeln!(formatter, "Vulkan quadratic autodiff wall-clock medians:")?;
+        writeln!(
+            formatter,
+            "  Elements | Custom forward/backward | Burn autodiff reference | Reference/custom"
+        )?;
+        for measurement in &self.measurements {
+            writeln!(
+                formatter,
+                "  {:>8} | {:>19.6} ms | {:>21.6} ms | {:>16.3}x",
+                measurement.elements,
+                measurement.custom_summary.median,
+                measurement.reference_summary.median,
+                measurement.reference_summary.median / measurement.custom_summary.median,
+            )?;
+        }
+
+        write!(
+            formatter,
+            "Vulkan quadratic autodiff timing JSON: {{\"schema\":1,\"build_profile\":\"{}\",\"fusion\":\"{}\",\"wall_clock_scope\":\"{CUSTOM_TRAINING_SCOPE}\",\"warmup_iterations\":{},\"synchronization\":\"{TIMING_SYNCHRONIZATION}\",\"measurements\":[",
+            self.build_profile, self.fusion, self.warmup_iterations
+        )?;
+        for (index, measurement) in self.measurements.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(",")?;
+            }
+            write!(
+                formatter,
+                "{{\"elements\":{},\"custom_samples_ms\":[",
+                measurement.elements
+            )?;
+            write_samples(formatter, &measurement.custom_samples_ms)?;
+            formatter.write_str("],\"reference_samples_ms\":[")?;
+            write_samples(formatter, &measurement.reference_samples_ms)?;
+            write!(
+                formatter,
+                "],\"custom_median_ms\":{:.6},\"reference_median_ms\":{:.6},\"reference_custom_median_ratio\":{:.6}}}",
+                measurement.custom_summary.median,
+                measurement.reference_summary.median,
+                measurement.reference_summary.median / measurement.custom_summary.median,
+            )?;
+        }
+        formatter.write_str("]}")
+    }
+}
+
 fn write_samples(formatter: &mut fmt::Formatter<'_>, samples: &[f64]) -> fmt::Result {
     for (index, sample) in samples.iter().enumerate() {
         if index > 0 {
@@ -422,6 +514,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     check_custom_op_parity(&cpu_custom_result, &vulkan_custom_result)?;
     let timing_report = measure_training_timing::<VulkanAutodiffBackend>(&device, tasks_max)?;
     let custom_timing_report = measure_custom_op_timing::<VulkanBackend>(&device)?;
+    let custom_training_timing_report =
+        measure_quadratic_training_timing::<VulkanAutodiffBackend>(&device)?;
 
     println!("{adapter_report}");
     println!("Vulkan forward output: {:?}", result.output);
@@ -455,6 +549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("{timing_report}");
     println!("{custom_timing_report}");
+    println!("{custom_training_timing_report}");
 
     Ok(())
 }
@@ -669,6 +764,95 @@ fn record_profile_timing_method(
     }
 }
 
+const QUADRATIC_TRAINING_ORDERS: [[QuadraticTrainingPath; 2]; 2] = [
+    [
+        QuadraticTrainingPath::Custom,
+        QuadraticTrainingPath::Reference,
+    ],
+    [
+        QuadraticTrainingPath::Reference,
+        QuadraticTrainingPath::Custom,
+    ],
+];
+
+fn measure_quadratic_training_timing<B>(
+    device: &WgpuDevice,
+) -> Result<VulkanCustomTrainingTimingReport, ProbeError>
+where
+    B: burn::tensor::backend::AutodiffBackend<Device = WgpuDevice, FloatElem = f32>
+        + CustomOpsBackend,
+{
+    let mut measurements = Vec::with_capacity(CUSTOM_TIMING_ELEMENTS.len());
+    for elements in CUSTOM_TIMING_ELEMENTS {
+        measurements.push(measure_quadratic_training_size::<B>(elements, device)?);
+    }
+
+    Ok(VulkanCustomTrainingTimingReport {
+        build_profile: build_profile(),
+        fusion: fusion_state(),
+        warmup_iterations: CUSTOM_TRAINING_WARMUP_ITERATIONS,
+        measurements,
+    })
+}
+
+fn measure_quadratic_training_size<B>(
+    elements: usize,
+    device: &WgpuDevice,
+) -> Result<CustomTrainingTimingMeasurement, ProbeError>
+where
+    B: burn::tensor::backend::AutodiffBackend<Device = WgpuDevice, FloatElem = f32>
+        + CustomOpsBackend,
+{
+    let input = Tensor::<B, 1>::ones([elements], device);
+    B::sync(device).map_err(|error| ProbeError::Synchronization(error.to_string()))?;
+
+    for iteration in 0..CUSTOM_TRAINING_WARMUP_ITERATIONS {
+        for path in quadratic_training_order(iteration) {
+            measure_quadratic_training_benchmark(input.clone(), path, device)?;
+        }
+    }
+
+    let mut custom_samples = Vec::with_capacity(TIMING_MEASURED_ITERATIONS);
+    let mut reference_samples = Vec::with_capacity(TIMING_MEASURED_ITERATIONS);
+    for iteration in 0..TIMING_MEASURED_ITERATIONS {
+        for path in quadratic_training_order(iteration) {
+            let sample = measure_quadratic_training_benchmark(input.clone(), path, device)?;
+            match path {
+                QuadraticTrainingPath::Custom => custom_samples.push(sample),
+                QuadraticTrainingPath::Reference => reference_samples.push(sample),
+            }
+        }
+    }
+
+    let (custom_samples_ms, custom_summary) = summarize_samples(&custom_samples);
+    let (reference_samples_ms, reference_summary) = summarize_samples(&reference_samples);
+    Ok(CustomTrainingTimingMeasurement {
+        elements,
+        custom_samples_ms,
+        custom_summary,
+        reference_samples_ms,
+        reference_summary,
+    })
+}
+
+fn quadratic_training_order(iteration: usize) -> [QuadraticTrainingPath; 2] {
+    QUADRATIC_TRAINING_ORDERS[iteration % QUADRATIC_TRAINING_ORDERS.len()]
+}
+
+fn measure_quadratic_training_benchmark<B>(
+    input: Tensor<B, 1>,
+    path: QuadraticTrainingPath,
+    device: &WgpuDevice,
+) -> Result<Duration, ProbeError>
+where
+    B: burn::tensor::backend::AutodiffBackend<Device = WgpuDevice, FloatElem = f32>
+        + CustomOpsBackend,
+{
+    let start = Instant::now();
+    run_synchronized_quadratic_training_workload(input, path, device)?;
+    Ok(start.elapsed())
+}
+
 fn measure_training_timing<B>(
     device: &B::Device,
     tasks_max: usize,
@@ -804,11 +988,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CUSTOM_PROFILE_SCOPE, CUSTOM_TIMING_SCOPE, CustomBenchmark, CustomTimingMeasurement,
-        TIMING_SCOPE, TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult,
-        VulkanAdapterReport, VulkanCustomTimingReport, check_training_parity,
-        custom_benchmark_order, timing_report,
+        CUSTOM_PROFILE_SCOPE, CUSTOM_TIMING_SCOPE, CUSTOM_TRAINING_SCOPE, CustomBenchmark,
+        CustomTimingMeasurement, CustomTrainingTimingMeasurement, TIMING_SCOPE,
+        TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult, VulkanAdapterReport,
+        VulkanCustomTimingReport, VulkanCustomTrainingTimingReport, check_training_parity,
+        custom_benchmark_order, quadratic_training_order, timing_report,
     };
+    use vulkan_ai::QuadraticTrainingPath;
 
     #[test]
     fn formats_vulkan_adapter_report() {
@@ -1028,6 +1214,64 @@ Vulkan compute capabilities:
             [CustomBenchmark::Reference, CustomBenchmark::Kernel]
         );
         assert_eq!(custom_benchmark_order(2), custom_benchmark_order(0));
+    }
+
+    #[test]
+    fn formats_quadratic_training_benchmark() {
+        let report = VulkanCustomTrainingTimingReport {
+            build_profile: "release",
+            fusion: "enabled",
+            warmup_iterations: 20,
+            measurements: vec![CustomTrainingTimingMeasurement {
+                elements: 4_096,
+                custom_samples_ms: vec![1.0, 2.0],
+                custom_summary: TimingSummary {
+                    min: 1.0,
+                    median: 1.5,
+                    p95: 2.0,
+                    max: 2.0,
+                },
+                reference_samples_ms: vec![3.0, 4.0],
+                reference_summary: TimingSummary {
+                    min: 3.0,
+                    median: 3.5,
+                    p95: 4.0,
+                    max: 4.0,
+                },
+            }],
+        };
+
+        let formatted = report.to_string();
+
+        assert!(formatted.contains(&format!("  Wall-clock scope: {CUSTOM_TRAINING_SCOPE}")));
+        assert!(
+            formatted.contains("      4096 |            1.500000 ms |              3.500000 ms |")
+        );
+        assert!(formatted.contains("2.333x"));
+        assert!(formatted.contains("\"schema\":1"));
+        assert!(formatted.contains(
+            "\"custom_samples_ms\":[1.000000,2.000000],\"reference_samples_ms\":[3.000000,4.000000]"
+        ));
+        assert!(formatted.contains("\"reference_custom_median_ratio\":2.333333"));
+    }
+
+    #[test]
+    fn rotates_quadratic_training_order() {
+        assert_eq!(
+            quadratic_training_order(0),
+            [
+                QuadraticTrainingPath::Custom,
+                QuadraticTrainingPath::Reference,
+            ]
+        );
+        assert_eq!(
+            quadratic_training_order(1),
+            [
+                QuadraticTrainingPath::Reference,
+                QuadraticTrainingPath::Custom,
+            ]
+        );
+        assert_eq!(quadratic_training_order(2), quadratic_training_order(0));
     }
 
     fn training_result(loss: f32) -> TrainingProbeResult {

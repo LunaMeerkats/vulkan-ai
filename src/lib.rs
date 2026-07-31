@@ -47,6 +47,15 @@ pub struct CustomOpProbeResult {
     pub input_gradient: Vec<f32>,
 }
 
+/// Forward implementation used by the quadratic autodiff benchmark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuadraticTrainingPath {
+    /// Use the backend-specific custom operation and its explicit backward rule.
+    Custom,
+    /// Compose portable Burn primitives and let Burn derive their backward graph.
+    Reference,
+}
+
 /// Error returned when a backend cannot complete the probe.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProbeError {
@@ -239,6 +248,41 @@ where
     Ok(())
 }
 
+/// Run a quadratic forward, mean-squared loss, and input-gradient backward pass.
+///
+/// The caller supplies a preallocated input so timing can exclude host upload.
+/// The custom path uses [`quadratic`] and its explicit backward rule; the
+/// reference path composes Burn primitives and uses their generated autodiff
+/// graph. Both paths synchronize without reading values back to the host.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] if the backend omits the input gradient or cannot
+/// synchronize the workload.
+pub fn run_synchronized_quadratic_training_workload<B>(
+    input: Tensor<B, 1>,
+    path: QuadraticTrainingPath,
+    device: &B::Device,
+) -> Result<(), ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32> + CustomOpsBackend,
+{
+    let input = input.require_grad();
+    let output = match path {
+        QuadraticTrainingPath::Custom => quadratic(input.clone()),
+        QuadraticTrainingPath::Reference => quadratic_reference(input.clone()),
+    };
+    let loss = output.clone().mul(output).mean();
+    let gradients = loss.clone().backward();
+    let input_gradient = input
+        .grad(&gradients)
+        .ok_or(ProbeError::MissingInputGradient)?;
+
+    B::sync(device).map_err(|error| ProbeError::Synchronization(error.to_string()))?;
+    std::hint::black_box((loss, input_gradient));
+    Ok(())
+}
+
 fn execute_training_probe<B>(device: &B::Device) -> Result<TrainingProbeTensors<B>, ProbeError>
 where
     B: AutodiffBackend<FloatElem = f32>,
@@ -281,8 +325,9 @@ mod tests {
     };
 
     use super::{
-        CustomOpProbeResult, ProbeResult, TrainingProbeResult, quadratic_reference,
-        run_autodiff_probe, run_custom_op_probe, run_synchronized_training_workload,
+        CustomOpProbeResult, ProbeResult, QuadraticTrainingPath, TrainingProbeResult,
+        quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+        run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
         run_training_probe,
     };
 
@@ -352,6 +397,19 @@ mod tests {
         type Backend = Autodiff<Flex>;
 
         run_synchronized_training_workload::<Backend>(&FlexDevice).unwrap();
+    }
+
+    #[test]
+    fn synchronizes_both_quadratic_training_paths_without_readback() {
+        type Backend = Autodiff<Flex>;
+
+        let input = Tensor::<Backend, 1>::ones([256], &FlexDevice);
+        for path in [
+            QuadraticTrainingPath::Custom,
+            QuadraticTrainingPath::Reference,
+        ] {
+            run_synchronized_quadratic_training_workload(input.clone(), path, &FlexDevice).unwrap();
+        }
     }
 
     fn assert_values_close(actual: &[f32], expected: &[f32]) {

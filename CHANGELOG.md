@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reproducible custom-kernel size sweep with raw wall-clock samples, CubeCL
   device profiles for the unfused backend, and explicit fused-profile
   limitations for separating execution from managed runtime overhead.
+- Balanced unfused/fused quadratic autodiff size sweep comparing the custom
+  forward and explicit backward rule with Burn's portable primitive graph,
+  including preallocated inputs, raw synchronized samples, and median ratios.
 
 ### Fixed
 
