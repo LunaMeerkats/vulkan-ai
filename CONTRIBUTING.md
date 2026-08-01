@@ -42,8 +42,8 @@ cargo test --features vulkan-fusion --bin vulkan-ai-probe
 
 The Vulkan test command compiles the GPU path and runs unit tests that do not
 initialize a GPU. Running the probe itself requires a compatible device and
-driver and compares its training and custom-operation results with the CPU
-backend. Use
+driver and compares its single-step gradients, 20-step SGD loss trajectory,
+final parameters, and custom-operation results with the CPU backend. Use
 `cargo run --release --features vulkan` and repeat with `vulkan-fusion` when
 changing timing, fusion, or synchronization behavior.
 
@@ -63,6 +63,11 @@ sizes. This second sweep uses preallocated inputs, a mean-squared output loss,
 balanced ordering, 20 warm-ups, 20 synchronized samples, and no host readback.
 Report both unfused and fused results when changing the operation or its
 autodiff integration.
+
+Optimizer or model changes must preserve the deterministic fixed
+initialization, batch, update count, and learning rate unless the protocol
+change is documented. Run both release commands and report loss reduction plus
+CPU/Vulkan final-parameter parity.
 
 ## Compatibility and releases
 

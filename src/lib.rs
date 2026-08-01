@@ -10,6 +10,7 @@ use burn::{
         Linear,
         loss::{MseLoss, Reduction},
     },
+    optim::{GradientsParams, Optimizer, SgdConfig},
     tensor::{Tensor, backend::AutodiffBackend},
 };
 use std::{error::Error, fmt};
@@ -38,6 +39,22 @@ pub struct TrainingProbeResult {
     pub bias_gradient: Vec<f32>,
 }
 
+/// Values produced by deterministic multi-step optimizer training.
+#[derive(Debug, PartialEq)]
+pub struct OptimizerProbeResult {
+    /// Mean squared error before training and after every optimizer step.
+    pub losses: Vec<f32>,
+    /// Linear weights after the final optimizer step.
+    pub final_weights: Vec<f32>,
+    /// Linear bias after the final optimizer step.
+    pub final_bias: Vec<f32>,
+}
+
+/// Number of full-batch SGD updates used by [`run_optimizer_probe`].
+pub const OPTIMIZER_PROBE_STEPS: usize = 20;
+/// Learning rate used by [`run_optimizer_probe`].
+pub const OPTIMIZER_PROBE_LEARNING_RATE: f64 = 0.05;
+
 /// Values produced by the custom quadratic operation and its backward rule.
 #[derive(Debug, PartialEq)]
 pub struct CustomOpProbeResult {
@@ -63,6 +80,8 @@ pub enum ProbeError {
     MissingGradient,
     /// The autodiff backend did not return the requested bias gradient.
     MissingBiasGradient,
+    /// The deterministic linear model did not contain its expected bias parameter.
+    MissingBiasParameter,
     /// The autodiff backend did not return the custom operation's input gradient.
     MissingInputGradient,
     /// Tensor data could not be converted to the expected `f32` values.
@@ -79,6 +98,9 @@ impl fmt::Display for ProbeError {
             Self::MissingGradient => formatter.write_str("the required weight gradient is missing"),
             Self::MissingBiasGradient => {
                 formatter.write_str("the required bias gradient is missing")
+            }
+            Self::MissingBiasParameter => {
+                formatter.write_str("the deterministic linear model bias is missing")
             }
             Self::MissingInputGradient => {
                 formatter.write_str("the custom operation input gradient is missing")
@@ -228,6 +250,71 @@ where
     })
 }
 
+/// Run deterministic full-batch SGD updates through a trainable linear model.
+///
+/// The fixed model, batch, learning rate, and update count make the complete
+/// loss trajectory and final parameters directly comparable across backends.
+/// The returned losses contain the initial loss followed by the loss after
+/// each optimizer step.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] if the model is missing its bias or tensor data
+/// cannot be converted to `f32` values.
+pub fn run_optimizer_probe<B>(device: &B::Device) -> Result<OptimizerProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    let (input, target) = training_batch::<B>(device);
+    let mut model = training_model::<B>(device);
+    let mut optimizer = SgdConfig::new().init::<B, Linear<B>>();
+    let mut losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
+
+    for step in 0..=OPTIMIZER_PROBE_STEPS {
+        let predictions = model.forward(input.clone());
+        let loss = MseLoss::new().forward(predictions, target.clone(), Reduction::Mean);
+        let loss_values = loss
+            .clone()
+            .into_data()
+            .into_vec::<f32>()
+            .map_err(|error| ProbeError::DataConversion(error.to_string()))?;
+        let loss_value = loss_values
+            .first()
+            .copied()
+            .ok_or_else(|| ProbeError::DataConversion("loss tensor was empty".to_owned()))?;
+        losses.push(loss_value);
+
+        if step == OPTIMIZER_PROBE_STEPS {
+            break;
+        }
+
+        let gradients = loss.backward();
+        let gradients = GradientsParams::from_grads(gradients, &model);
+        model = optimizer.step(OPTIMIZER_PROBE_LEARNING_RATE, model, gradients);
+    }
+
+    let final_weights = model
+        .weight
+        .val()
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ProbeError::DataConversion(error.to_string()))?;
+    let final_bias = model
+        .bias
+        .as_ref()
+        .ok_or(ProbeError::MissingBiasParameter)?
+        .val()
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ProbeError::DataConversion(error.to_string()))?;
+
+    Ok(OptimizerProbeResult {
+        losses,
+        final_weights,
+        final_bias,
+    })
+}
+
 /// Run the deterministic training workload and wait for backend completion.
 ///
 /// Unlike [`run_training_probe`], this function does not read tensor values
@@ -287,15 +374,8 @@ fn execute_training_probe<B>(device: &B::Device) -> Result<TrainingProbeTensors<
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
-    let input = Tensor::<B, 2>::from_floats([[1.0, 2.0], [3.0, 4.0], [-1.0, 0.5]], device);
-    let target = Tensor::<B, 2>::from_floats([[1.0], [2.0], [-0.5]], device);
-    let model = Linear {
-        weight: Param::from_tensor(Tensor::<B, 2>::from_floats([[0.5], [-0.25]], device)),
-        bias: Some(Param::from_tensor(Tensor::<B, 1>::from_floats(
-            [0.1],
-            device,
-        ))),
-    };
+    let (input, target) = training_batch::<B>(device);
+    let model = training_model::<B>(device);
 
     let weight = model.weight.val();
     let Some(bias) = model.bias.as_ref().map(Param::val) else {
@@ -317,6 +397,29 @@ where
     })
 }
 
+fn training_batch<B>(device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 2>)
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    (
+        Tensor::<B, 2>::from_floats([[1.0, 2.0], [3.0, 4.0], [-1.0, 0.5]], device),
+        Tensor::<B, 2>::from_floats([[1.0], [2.0], [-0.5]], device),
+    )
+}
+
+fn training_model<B>(device: &B::Device) -> Linear<B>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    Linear {
+        weight: Param::from_tensor(Tensor::<B, 2>::from_floats([[0.5], [-0.25]], device)),
+        bias: Some(Param::from_tensor(Tensor::<B, 1>::from_floats(
+            [0.1],
+            device,
+        ))),
+    }
+}
+
 #[cfg(all(test, feature = "cpu"))]
 mod tests {
     use burn::{
@@ -325,10 +428,10 @@ mod tests {
     };
 
     use super::{
-        CustomOpProbeResult, ProbeResult, QuadraticTrainingPath, TrainingProbeResult,
-        quadratic_reference, run_autodiff_probe, run_custom_op_probe,
-        run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
-        run_training_probe,
+        CustomOpProbeResult, OPTIMIZER_PROBE_STEPS, ProbeResult, QuadraticTrainingPath,
+        TrainingProbeResult, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+        run_optimizer_probe, run_synchronized_quadratic_training_workload,
+        run_synchronized_training_workload, run_training_probe,
     };
 
     #[test]
@@ -362,6 +465,20 @@ mod tests {
         assert_values_close(&[result.loss], &[expected.loss]);
         assert_values_close(&result.weight_gradient, &expected.weight_gradient);
         assert_values_close(&result.bias_gradient, &expected.bias_gradient);
+    }
+
+    #[test]
+    fn optimizer_reduces_loss_to_expected_parameters() {
+        type Backend = Autodiff<Flex>;
+
+        let result = run_optimizer_probe::<Backend>(&FlexDevice).unwrap();
+
+        assert_eq!(result.losses.len(), OPTIMIZER_PROBE_STEPS + 1);
+        assert!(result.losses.windows(2).all(|losses| losses[1] < losses[0]));
+        assert_values_close(&[result.losses[0]], &[0.923_541_67]);
+        assert_values_close(&[result.losses[OPTIMIZER_PROBE_STEPS]], &[0.013_698_871]);
+        assert_values_close(&result.final_weights, &[0.640_245_14, -0.012_434_039]);
+        assert_values_close(&result.final_bias, &[0.209_908_92]);
     }
 
     #[test]
