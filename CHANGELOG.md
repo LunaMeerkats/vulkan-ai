@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Balanced unfused/fused quadratic autodiff size sweep comparing the custom
   forward and explicit backward rule with Burn's portable primitive graph,
   including preallocated inputs, raw synchronized samples, and median ratios.
+- Deterministic 20-step full-batch SGD probe with loss-reduction checks and
+  CPU/Vulkan parity for the complete loss trajectory and final parameters.
 
 ### Fixed
 

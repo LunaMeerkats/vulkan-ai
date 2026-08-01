@@ -50,6 +50,10 @@ probe's Vulkan `f32` forward path is one CubeCL kernel, including under Burn
 fusion; the parity input is a transposed two-dimensional tensor so the probe
 also exercises the documented contiguous-copy path for non-contiguous layouts.
 
+The same fixed linear model also runs 20 full-batch SGD updates at a learning
+rate of `0.05`. The probe requires loss reduction and compares the complete
+loss trajectory plus final weights and bias between CPU and Vulkan.
+
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
 synchronization, and host readback is excluded. The report records the build
@@ -101,15 +105,18 @@ performance claim.
 ```text
 Vulkan forward output: [8.0, 18.0]
 Vulkan weight gradient: [4.0, 6.0]
+Vulkan optimizer loss: 0.92354155 -> 0.013698872 over 20 SGD steps at learning rate 0.05
+Vulkan optimizer final weights: [0.64024514, -0.012434009]
+Vulkan optimizer final bias: [0.20990893]
 Vulkan custom quadratic output: [2.0, -0.25, 0.0, 3.75]
 Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 ```
 
 ## Near-term roadmap
 
-- Add a deterministic multi-step optimizer probe that verifies loss reduction
-  and CPU/Vulkan parameter parity before expanding to larger models. The
-  quadratic experiments do not justify lower-level Vulkan interoperability.
+- Add deterministic optimizer/model checkpoint-and-resume parity before
+  expanding to larger models. The quadratic experiments do not justify
+  lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

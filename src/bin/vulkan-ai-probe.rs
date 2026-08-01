@@ -14,8 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, CustomOpsBackend, ProbeError, QuadraticTrainingPath, TrainingProbeResult,
-    quadratic, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+    CustomOpProbeResult, CustomOpsBackend, OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS,
+    OptimizerProbeResult, ProbeError, QuadraticTrainingPath, TrainingProbeResult, quadratic,
+    quadratic_reference, run_autodiff_probe, run_custom_op_probe, run_optimizer_probe,
     run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
     run_training_probe,
 };
@@ -509,6 +510,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_training_result = run_training_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_training_result = run_training_probe::<VulkanAutodiffBackend>(&device)?;
     check_training_parity(&cpu_training_result, &vulkan_training_result)?;
+    let cpu_optimizer_result = run_optimizer_probe::<CpuBackend>(&FlexDevice)?;
+    let vulkan_optimizer_result = run_optimizer_probe::<VulkanAutodiffBackend>(&device)?;
+    check_optimizer_parity(&cpu_optimizer_result, &vulkan_optimizer_result)?;
     let cpu_custom_result = run_custom_op_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_custom_result = run_custom_op_probe::<VulkanAutodiffBackend>(&device)?;
     check_custom_op_parity(&cpu_custom_result, &vulkan_custom_result)?;
@@ -535,6 +539,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "CPU/Vulkan training parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+    );
+    println!(
+        "Vulkan optimizer loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}",
+        vulkan_optimizer_result.losses[0], vulkan_optimizer_result.losses[OPTIMIZER_PROBE_STEPS]
+    );
+    println!(
+        "Vulkan optimizer final weights: {:?}",
+        vulkan_optimizer_result.final_weights
+    );
+    println!(
+        "Vulkan optimizer final bias: {:?}",
+        vulkan_optimizer_result.final_bias
+    );
+    println!(
+        "CPU/Vulkan optimizer loss and parameter parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
     println!(
         "Vulkan custom quadratic output: {:?}",
@@ -944,6 +963,44 @@ fn check_training_parity(
     check_values("bias gradient", &cpu.bias_gradient, &vulkan.bias_gradient)
 }
 
+fn check_optimizer_parity(
+    cpu: &OptimizerProbeResult,
+    vulkan: &OptimizerProbeResult,
+) -> Result<(), String> {
+    check_loss_reduction("CPU", cpu)?;
+    check_loss_reduction("Vulkan", vulkan)?;
+    check_values("optimizer loss trajectory", &cpu.losses, &vulkan.losses)?;
+    check_values(
+        "optimizer final weights",
+        &cpu.final_weights,
+        &vulkan.final_weights,
+    )?;
+    check_values("optimizer final bias", &cpu.final_bias, &vulkan.final_bias)
+}
+
+fn check_loss_reduction(backend: &str, result: &OptimizerProbeResult) -> Result<(), String> {
+    let Some((&initial_loss, remaining_losses)) = result.losses.split_first() else {
+        return Err(format!("{backend} optimizer loss trajectory is empty"));
+    };
+    let Some(&final_loss) = remaining_losses.last() else {
+        return Err(format!(
+            "{backend} optimizer loss trajectory has no post-update value"
+        ));
+    };
+    if !initial_loss.is_finite() || !final_loss.is_finite() {
+        return Err(format!(
+            "{backend} optimizer loss is non-finite: {initial_loss} -> {final_loss}"
+        ));
+    }
+    if final_loss >= initial_loss {
+        return Err(format!(
+            "{backend} optimizer did not reduce loss: {initial_loss} -> {final_loss}"
+        ));
+    }
+
+    Ok(())
+}
+
 fn check_custom_op_parity(
     cpu: &CustomOpProbeResult,
     vulkan: &CustomOpProbeResult,
@@ -991,10 +1048,10 @@ mod tests {
         CUSTOM_PROFILE_SCOPE, CUSTOM_TIMING_SCOPE, CUSTOM_TRAINING_SCOPE, CustomBenchmark,
         CustomTimingMeasurement, CustomTrainingTimingMeasurement, TIMING_SCOPE,
         TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult, VulkanAdapterReport,
-        VulkanCustomTimingReport, VulkanCustomTrainingTimingReport, check_training_parity,
-        custom_benchmark_order, quadratic_training_order, timing_report,
+        VulkanCustomTimingReport, VulkanCustomTrainingTimingReport, check_optimizer_parity,
+        check_training_parity, custom_benchmark_order, quadratic_training_order, timing_report,
     };
-    use vulkan_ai::QuadraticTrainingPath;
+    use vulkan_ai::{OptimizerProbeResult, QuadraticTrainingPath};
 
     #[test]
     fn formats_vulkan_adapter_report() {
@@ -1073,6 +1130,24 @@ Vulkan compute capabilities:
             error,
             "CPU/Vulkan loss contains a non-finite value at index 0: 0.5 versus NaN"
         );
+    }
+
+    #[test]
+    fn accepts_optimizer_loss_reduction_and_parameter_parity() {
+        let cpu = optimizer_result(0.01);
+        let vulkan = optimizer_result(0.010_000_1);
+
+        check_optimizer_parity(&cpu, &vulkan).unwrap();
+    }
+
+    #[test]
+    fn rejects_optimizer_without_loss_reduction() {
+        let cpu = optimizer_result(1.0);
+        let vulkan = optimizer_result(0.01);
+
+        let error = check_optimizer_parity(&cpu, &vulkan).unwrap_err();
+
+        assert_eq!(error, "CPU optimizer did not reduce loss: 1 -> 1");
     }
 
     #[test]
@@ -1280,6 +1355,14 @@ Vulkan compute capabilities:
             loss,
             weight_gradient: vec![-3.383_333_4, -4.941_667],
             bias_gradient: vec![-1.55],
+        }
+    }
+
+    fn optimizer_result(final_loss: f32) -> OptimizerProbeResult {
+        OptimizerProbeResult {
+            losses: vec![1.0, final_loss],
+            final_weights: vec![0.6, -0.01],
+            final_bias: vec![0.2],
         }
     }
 }
