@@ -67,7 +67,12 @@ autodiff integration.
 Optimizer or model changes must preserve the deterministic fixed
 initialization, batch, update count, and learning rate unless the protocol
 change is documented. Run both release commands and report loss reduction plus
-CPU/Vulkan final-parameter parity.
+CPU/Vulkan final-parameter parity. Checkpoint changes must serialize the model
+and optimizer with full precision, restore both into fresh instances, and
+compare the complete resumed trajectory and final parameters with uninterrupted
+training on CPU and Vulkan. The current stateful protocol checkpoints after
+step 10 of 20 using SGD momentum `0.9`, dampening `0.1`, and no Nesterov
+momentum.
 
 ## Compatibility and releases
 

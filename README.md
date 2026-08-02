@@ -54,6 +54,15 @@ The same fixed linear model also runs 20 full-batch SGD updates at a learning
 rate of `0.05`. The probe requires loss reduction and compares the complete
 loss trajectory plus final weights and bias between CPU and Vulkan.
 
+A separate checkpoint/resume probe uses the same model, batch, learning rate,
+and update count with stateful SGD momentum `0.9`, dampening `0.1`, and
+Nesterov momentum disabled. After update 10, it serializes both the model and
+optimizer to full-precision named MessagePack bytes, restores them into fresh
+instances, and completes training. The probe compares the uninterrupted and
+resumed loss trajectories and final parameters on each backend, then compares
+the resumed CPU and Vulkan results. It also reports the two in-memory
+checkpoint sizes; no checkpoint artifact is written to the repository.
+
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
 synchronization, and host readback is excluded. The report records the build
@@ -108,15 +117,17 @@ Vulkan weight gradient: [4.0, 6.0]
 Vulkan optimizer loss: 0.92354155 -> 0.013698872 over 20 SGD steps at learning rate 0.05
 Vulkan optimizer final weights: [0.64024514, -0.012434009]
 Vulkan optimizer final bias: [0.20990893]
+Vulkan checkpoint/resume loss: 0.92354155 -> 0.13259129 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10 (momentum 0.9, dampening 0.1)
+Vulkan checkpoint size: model 321 bytes, optimizer 351 bytes
 Vulkan custom quadratic output: [2.0, -0.25, 0.0, 3.75]
 Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 ```
 
 ## Near-term roadmap
 
-- Add deterministic optimizer/model checkpoint-and-resume parity before
-  expanding to larger models. The quadratic experiments do not justify
-  lower-level Vulkan interoperability.
+- Extend deterministic CPU/Vulkan training and checkpoint parity to a small
+  nonlinear model. The quadratic experiments do not justify lower-level
+  Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

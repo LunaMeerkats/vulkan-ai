@@ -5,12 +5,13 @@
 mod ops;
 
 use burn::{
-    module::Param,
+    module::{Module, Param},
     nn::{
         Linear,
         loss::{MseLoss, Reduction},
     },
-    optim::{GradientsParams, Optimizer, SgdConfig},
+    optim::{GradientsParams, Optimizer, SgdConfig, momentum::MomentumConfig},
+    record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder},
     tensor::{Tensor, backend::AutodiffBackend},
 };
 use std::{error::Error, fmt};
@@ -50,10 +51,29 @@ pub struct OptimizerProbeResult {
     pub final_bias: Vec<f32>,
 }
 
+/// Values produced by uninterrupted and checkpoint-resumed optimizer training.
+#[derive(Debug, PartialEq)]
+pub struct OptimizerCheckpointProbeResult {
+    /// Result from training straight through without interruption.
+    pub uninterrupted: OptimizerProbeResult,
+    /// Result from serializing and restoring the model and optimizer mid-run.
+    pub resumed: OptimizerProbeResult,
+    /// Size of the full-precision named `MessagePack` model checkpoint.
+    pub model_checkpoint_bytes: usize,
+    /// Size of the full-precision named `MessagePack` optimizer checkpoint.
+    pub optimizer_checkpoint_bytes: usize,
+}
+
 /// Number of full-batch SGD updates used by [`run_optimizer_probe`].
 pub const OPTIMIZER_PROBE_STEPS: usize = 20;
 /// Learning rate used by [`run_optimizer_probe`].
 pub const OPTIMIZER_PROBE_LEARNING_RATE: f64 = 0.05;
+/// Update after which [`run_optimizer_checkpoint_probe`] saves and restores state.
+pub const OPTIMIZER_CHECKPOINT_STEP: usize = OPTIMIZER_PROBE_STEPS / 2;
+/// Momentum factor used by the stateful checkpoint/resume probe.
+pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
+/// Dampening factor used by the stateful checkpoint/resume probe.
+pub const OPTIMIZER_CHECKPOINT_DAMPENING: f64 = 0.1;
 
 /// Values produced by the custom quadratic operation and its backward rule.
 #[derive(Debug, PartialEq)]
@@ -86,6 +106,8 @@ pub enum ProbeError {
     MissingInputGradient,
     /// Tensor data could not be converted to the expected `f32` values.
     DataConversion(String),
+    /// Model or optimizer state could not be serialized or restored.
+    CheckpointSerialization(String),
     /// The backend could not synchronize a measured workload.
     Synchronization(String),
     /// `CubeCL` could not profile a measured workload consistently.
@@ -107,6 +129,12 @@ impl fmt::Display for ProbeError {
             }
             Self::DataConversion(message) => {
                 write!(formatter, "could not read probe tensor data: {message}")
+            }
+            Self::CheckpointSerialization(message) => {
+                write!(
+                    formatter,
+                    "could not round-trip checkpoint state: {message}"
+                )
             }
             Self::Synchronization(message) => {
                 write!(
@@ -266,33 +294,163 @@ where
     B: AutodiffBackend<FloatElem = f32>,
 {
     let (input, target) = training_batch::<B>(device);
-    let mut model = training_model::<B>(device);
+    let model = training_model::<B>(device);
     let mut optimizer = SgdConfig::new().init::<B, Linear<B>>();
     let mut losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
+    let model = run_optimizer_updates(
+        model,
+        &mut optimizer,
+        &input,
+        &target,
+        OPTIMIZER_PROBE_STEPS,
+        &mut losses,
+    )?;
 
-    for step in 0..=OPTIMIZER_PROBE_STEPS {
-        let predictions = model.forward(input.clone());
-        let loss = MseLoss::new().forward(predictions, target.clone(), Reduction::Mean);
-        let loss_values = loss
-            .clone()
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|error| ProbeError::DataConversion(error.to_string()))?;
-        let loss_value = loss_values
-            .first()
-            .copied()
-            .ok_or_else(|| ProbeError::DataConversion("loss tensor was empty".to_owned()))?;
-        losses.push(loss_value);
+    optimizer_probe_result(&model, losses)
+}
 
-        if step == OPTIMIZER_PROBE_STEPS {
-            break;
-        }
+/// Compare uninterrupted stateful SGD with a serialized checkpoint/resume run.
+///
+/// Both paths use the fixed model, batch, learning rate, update count, and
+/// momentum settings. The resumed path records full-precision named
+/// `MessagePack` bytes for the model and optimizer after
+/// [`OPTIMIZER_CHECKPOINT_STEP`] updates, restores both into fresh instances,
+/// and completes the remaining updates.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] if tensor data cannot be read, the model is missing
+/// its bias, or either checkpoint cannot be serialized or restored.
+pub fn run_optimizer_checkpoint_probe<B>(
+    device: &B::Device,
+) -> Result<OptimizerCheckpointProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    let (input, target) = training_batch::<B>(device);
 
+    let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, Linear<B>>();
+    let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
+    let uninterrupted_model = run_optimizer_updates(
+        training_model::<B>(device),
+        &mut uninterrupted_optimizer,
+        &input,
+        &target,
+        OPTIMIZER_PROBE_STEPS,
+        &mut uninterrupted_losses,
+    )?;
+    let uninterrupted = optimizer_probe_result(&uninterrupted_model, uninterrupted_losses)?;
+
+    let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, Linear<B>>();
+    let mut resumed_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
+    let resumed_model = run_optimizer_updates(
+        training_model::<B>(device),
+        &mut resumed_optimizer,
+        &input,
+        &target,
+        OPTIMIZER_CHECKPOINT_STEP,
+        &mut resumed_losses,
+    )?;
+
+    let recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
+    let model_checkpoint =
+        Recorder::<B>::record(&recorder, resumed_model.clone().into_record(), ())
+            .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let optimizer_checkpoint = Recorder::<B>::record(&recorder, resumed_optimizer.to_record(), ())
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let model_checkpoint_bytes = model_checkpoint.len();
+    let optimizer_checkpoint_bytes = optimizer_checkpoint.len();
+
+    let restored_model_record = Recorder::<B>::load(&recorder, model_checkpoint, device)
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let restored_model = training_model::<B>(device).load_record(restored_model_record);
+    let restored_optimizer_record = Recorder::<B>::load(&recorder, optimizer_checkpoint, device)
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let mut restored_optimizer = checkpoint_optimizer_config()
+        .init::<B, Linear<B>>()
+        .load_record(restored_optimizer_record);
+
+    let resumed_model = run_optimizer_updates(
+        restored_model,
+        &mut restored_optimizer,
+        &input,
+        &target,
+        OPTIMIZER_PROBE_STEPS - OPTIMIZER_CHECKPOINT_STEP,
+        &mut resumed_losses,
+    )?;
+    let resumed = optimizer_probe_result(&resumed_model, resumed_losses)?;
+
+    Ok(OptimizerCheckpointProbeResult {
+        uninterrupted,
+        resumed,
+        model_checkpoint_bytes,
+        optimizer_checkpoint_bytes,
+    })
+}
+
+fn checkpoint_optimizer_config() -> SgdConfig {
+    SgdConfig::new().with_momentum(Some(MomentumConfig {
+        momentum: OPTIMIZER_CHECKPOINT_MOMENTUM,
+        dampening: OPTIMIZER_CHECKPOINT_DAMPENING,
+        nesterov: false,
+    }))
+}
+
+fn run_optimizer_updates<B, O>(
+    mut model: Linear<B>,
+    optimizer: &mut O,
+    input: &Tensor<B, 2>,
+    target: &Tensor<B, 2>,
+    steps: usize,
+    losses: &mut Vec<f32>,
+) -> Result<Linear<B>, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+    O: Optimizer<Linear<B>, B>,
+{
+    let mut loss = MseLoss::new().forward(
+        model.forward(input.clone()),
+        target.clone(),
+        Reduction::Mean,
+    );
+    if losses.is_empty() {
+        losses.push(read_loss(loss.clone())?);
+    }
+
+    for _ in 0..steps {
         let gradients = loss.backward();
         let gradients = GradientsParams::from_grads(gradients, &model);
         model = optimizer.step(OPTIMIZER_PROBE_LEARNING_RATE, model, gradients);
+        loss = MseLoss::new().forward(
+            model.forward(input.clone()),
+            target.clone(),
+            Reduction::Mean,
+        );
+        losses.push(read_loss(loss.clone())?);
     }
 
+    Ok(model)
+}
+
+fn read_loss<B>(loss: Tensor<B, 1>) -> Result<f32, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    loss.into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ProbeError::DataConversion(error.to_string()))?
+        .first()
+        .copied()
+        .ok_or_else(|| ProbeError::DataConversion("loss tensor was empty".to_owned()))
+}
+
+fn optimizer_probe_result<B>(
+    model: &Linear<B>,
+    losses: Vec<f32>,
+) -> Result<OptimizerProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
     let final_weights = model
         .weight
         .val()
@@ -428,10 +586,11 @@ mod tests {
     };
 
     use super::{
-        CustomOpProbeResult, OPTIMIZER_PROBE_STEPS, ProbeResult, QuadraticTrainingPath,
-        TrainingProbeResult, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
-        run_optimizer_probe, run_synchronized_quadratic_training_workload,
-        run_synchronized_training_workload, run_training_probe,
+        CustomOpProbeResult, OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_STEPS, ProbeResult,
+        QuadraticTrainingPath, TrainingProbeResult, quadratic_reference, run_autodiff_probe,
+        run_custom_op_probe, run_optimizer_checkpoint_probe, run_optimizer_probe,
+        run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
+        run_training_probe,
     };
 
     #[test]
@@ -479,6 +638,22 @@ mod tests {
         assert_values_close(&[result.losses[OPTIMIZER_PROBE_STEPS]], &[0.013_698_871]);
         assert_values_close(&result.final_weights, &[0.640_245_14, -0.012_434_039]);
         assert_values_close(&result.final_bias, &[0.209_908_92]);
+    }
+
+    #[test]
+    fn optimizer_checkpoint_resume_matches_uninterrupted_training() {
+        type Backend = Autodiff<Flex>;
+
+        let result = run_optimizer_checkpoint_probe::<Backend>(&FlexDevice).unwrap();
+
+        assert_eq!(OPTIMIZER_CHECKPOINT_STEP, 10);
+        assert_eq!(result.uninterrupted.losses.len(), OPTIMIZER_PROBE_STEPS + 1);
+        assert_eq!(result.uninterrupted, result.resumed);
+        assert!(result.model_checkpoint_bytes > 0);
+        assert!(result.optimizer_checkpoint_bytes > 0);
+        assert!(
+            result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS] < result.uninterrupted.losses[0]
+        );
     }
 
     #[test]
