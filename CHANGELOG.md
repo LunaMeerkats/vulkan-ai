@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including preallocated inputs, raw synchronized samples, and median ratios.
 - Deterministic 20-step full-batch SGD probe with loss-reduction checks and
   CPU/Vulkan parity for the complete loss trajectory and final parameters.
+- Full-precision model and stateful momentum-SGD checkpoint round trip after
+  step 10, with uninterrupted/resumed and CPU/Vulkan trajectory and parameter
+  parity checks.
 
 ### Fixed
 

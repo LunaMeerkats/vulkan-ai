@@ -14,9 +14,11 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, CustomOpsBackend, OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS,
-    OptimizerProbeResult, ProbeError, QuadraticTrainingPath, TrainingProbeResult, quadratic,
-    quadratic_reference, run_autodiff_probe, run_custom_op_probe, run_optimizer_probe,
+    CustomOpProbeResult, CustomOpsBackend, OPTIMIZER_CHECKPOINT_DAMPENING,
+    OPTIMIZER_CHECKPOINT_MOMENTUM, OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_LEARNING_RATE,
+    OPTIMIZER_PROBE_STEPS, OptimizerCheckpointProbeResult, OptimizerProbeResult, ProbeError,
+    QuadraticTrainingPath, TrainingProbeResult, quadratic, quadratic_reference, run_autodiff_probe,
+    run_custom_op_probe, run_optimizer_checkpoint_probe, run_optimizer_probe,
     run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
     run_training_probe,
 };
@@ -513,6 +515,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_optimizer_result = run_optimizer_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_optimizer_result = run_optimizer_probe::<VulkanAutodiffBackend>(&device)?;
     check_optimizer_parity(&cpu_optimizer_result, &vulkan_optimizer_result)?;
+    let cpu_checkpoint_result = run_optimizer_checkpoint_probe::<CpuBackend>(&FlexDevice)?;
+    let vulkan_checkpoint_result =
+        run_optimizer_checkpoint_probe::<VulkanAutodiffBackend>(&device)?;
+    check_optimizer_checkpoint_parity(&cpu_checkpoint_result, &vulkan_checkpoint_result)?;
     let cpu_custom_result = run_custom_op_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_custom_result = run_custom_op_probe::<VulkanAutodiffBackend>(&device)?;
     check_custom_op_parity(&cpu_custom_result, &vulkan_custom_result)?;
@@ -540,21 +546,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "CPU/Vulkan training parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
-    println!(
-        "Vulkan optimizer loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}",
-        vulkan_optimizer_result.losses[0], vulkan_optimizer_result.losses[OPTIMIZER_PROBE_STEPS]
-    );
-    println!(
-        "Vulkan optimizer final weights: {:?}",
-        vulkan_optimizer_result.final_weights
-    );
-    println!(
-        "Vulkan optimizer final bias: {:?}",
-        vulkan_optimizer_result.final_bias
-    );
-    println!(
-        "CPU/Vulkan optimizer loss and parameter parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
-    );
+    print_optimizer_results(&vulkan_optimizer_result, &vulkan_checkpoint_result);
     println!(
         "Vulkan custom quadratic output: {:?}",
         vulkan_custom_result.output
@@ -571,6 +563,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{custom_training_timing_report}");
 
     Ok(())
+}
+
+fn print_optimizer_results(
+    optimizer: &OptimizerProbeResult,
+    checkpoint: &OptimizerCheckpointProbeResult,
+) {
+    println!(
+        "Vulkan optimizer loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}",
+        optimizer.losses[0], optimizer.losses[OPTIMIZER_PROBE_STEPS]
+    );
+    println!(
+        "Vulkan optimizer final weights: {:?}",
+        optimizer.final_weights
+    );
+    println!("Vulkan optimizer final bias: {:?}", optimizer.final_bias);
+    println!(
+        "CPU/Vulkan optimizer loss and parameter parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+    );
+    println!(
+        "Vulkan checkpoint/resume loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} momentum SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}; checkpoint restored after step {OPTIMIZER_CHECKPOINT_STEP} (momentum {OPTIMIZER_CHECKPOINT_MOMENTUM}, dampening {OPTIMIZER_CHECKPOINT_DAMPENING})",
+        checkpoint.resumed.losses[0], checkpoint.resumed.losses[OPTIMIZER_PROBE_STEPS]
+    );
+    println!(
+        "Vulkan checkpoint size: model {} bytes, optimizer {} bytes",
+        checkpoint.model_checkpoint_bytes, checkpoint.optimizer_checkpoint_bytes
+    );
+    println!(
+        "CPU/Vulkan uninterrupted and checkpoint-resumed parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -969,13 +990,65 @@ fn check_optimizer_parity(
 ) -> Result<(), String> {
     check_loss_reduction("CPU", cpu)?;
     check_loss_reduction("Vulkan", vulkan)?;
-    check_values("optimizer loss trajectory", &cpu.losses, &vulkan.losses)?;
-    check_values(
-        "optimizer final weights",
-        &cpu.final_weights,
-        &vulkan.final_weights,
+    check_optimizer_results("CPU", cpu, "Vulkan", vulkan)
+}
+
+fn check_optimizer_checkpoint_parity(
+    cpu: &OptimizerCheckpointProbeResult,
+    vulkan: &OptimizerCheckpointProbeResult,
+) -> Result<(), String> {
+    check_loss_reduction("CPU uninterrupted", &cpu.uninterrupted)?;
+    check_loss_reduction("CPU resumed", &cpu.resumed)?;
+    check_loss_reduction("Vulkan uninterrupted", &vulkan.uninterrupted)?;
+    check_loss_reduction("Vulkan resumed", &vulkan.resumed)?;
+    check_optimizer_results(
+        "CPU uninterrupted",
+        &cpu.uninterrupted,
+        "CPU resumed",
+        &cpu.resumed,
     )?;
-    check_values("optimizer final bias", &cpu.final_bias, &vulkan.final_bias)
+    check_optimizer_results(
+        "Vulkan uninterrupted",
+        &vulkan.uninterrupted,
+        "Vulkan resumed",
+        &vulkan.resumed,
+    )?;
+    check_optimizer_results(
+        "CPU resumed",
+        &cpu.resumed,
+        "Vulkan resumed",
+        &vulkan.resumed,
+    )
+}
+
+fn check_optimizer_results(
+    left_name: &str,
+    left: &OptimizerProbeResult,
+    right_name: &str,
+    right: &OptimizerProbeResult,
+) -> Result<(), String> {
+    check_named_values(
+        "optimizer loss trajectory",
+        left_name,
+        &left.losses,
+        right_name,
+        &right.losses,
+    )?;
+    check_named_values(
+        "optimizer final weights",
+        left_name,
+        &left.final_weights,
+        right_name,
+        &right.final_weights,
+    )?;
+    check_named_values(
+        "optimizer final bias",
+        left_name,
+        &left.final_bias,
+        right_name,
+        &right.final_bias,
+    )?;
+    Ok(())
 }
 
 fn check_loss_reduction(backend: &str, result: &OptimizerProbeResult) -> Result<(), String> {
@@ -1014,25 +1087,35 @@ fn check_custom_op_parity(
 }
 
 fn check_values(name: &str, cpu: &[f32], vulkan: &[f32]) -> Result<(), String> {
-    if cpu.len() != vulkan.len() {
+    check_named_values(name, "CPU", cpu, "Vulkan", vulkan)
+}
+
+fn check_named_values(
+    name: &str,
+    left_name: &str,
+    left: &[f32],
+    right_name: &str,
+    right: &[f32],
+) -> Result<(), String> {
+    if left.len() != right.len() {
         return Err(format!(
-            "CPU/Vulkan {name} length differs: {} versus {}",
-            cpu.len(),
-            vulkan.len()
+            "{left_name}/{right_name} {name} length differs: {} versus {}",
+            left.len(),
+            right.len()
         ));
     }
 
-    for (index, (&cpu_value, &vulkan_value)) in cpu.iter().zip(vulkan).enumerate() {
-        if !cpu_value.is_finite() || !vulkan_value.is_finite() {
+    for (index, (&left_value, &right_value)) in left.iter().zip(right).enumerate() {
+        if !left_value.is_finite() || !right_value.is_finite() {
             return Err(format!(
-                "CPU/Vulkan {name} contains a non-finite value at index {index}: {cpu_value} versus {vulkan_value}"
+                "{left_name}/{right_name} {name} contains a non-finite value at index {index}: {left_value} versus {right_value}"
             ));
         }
 
-        let tolerance = PARITY_ABSOLUTE_TOLERANCE + PARITY_RELATIVE_TOLERANCE * cpu_value.abs();
-        if (cpu_value - vulkan_value).abs() > tolerance {
+        let tolerance = PARITY_ABSOLUTE_TOLERANCE + PARITY_RELATIVE_TOLERANCE * left_value.abs();
+        if (left_value - right_value).abs() > tolerance {
             return Err(format!(
-                "CPU/Vulkan {name} differs at index {index}: {cpu_value} versus {vulkan_value} (tolerance {tolerance})"
+                "{left_name}/{right_name} {name} differs at index {index}: {left_value} versus {right_value} (tolerance {tolerance})"
             ));
         }
     }
@@ -1048,10 +1131,11 @@ mod tests {
         CUSTOM_PROFILE_SCOPE, CUSTOM_TIMING_SCOPE, CUSTOM_TRAINING_SCOPE, CustomBenchmark,
         CustomTimingMeasurement, CustomTrainingTimingMeasurement, TIMING_SCOPE,
         TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult, VulkanAdapterReport,
-        VulkanCustomTimingReport, VulkanCustomTrainingTimingReport, check_optimizer_parity,
-        check_training_parity, custom_benchmark_order, quadratic_training_order, timing_report,
+        VulkanCustomTimingReport, VulkanCustomTrainingTimingReport,
+        check_optimizer_checkpoint_parity, check_optimizer_parity, check_training_parity,
+        custom_benchmark_order, quadratic_training_order, timing_report,
     };
-    use vulkan_ai::{OptimizerProbeResult, QuadraticTrainingPath};
+    use vulkan_ai::{OptimizerCheckpointProbeResult, OptimizerProbeResult, QuadraticTrainingPath};
 
     #[test]
     fn formats_vulkan_adapter_report() {
@@ -1148,6 +1232,26 @@ Vulkan compute capabilities:
         let error = check_optimizer_parity(&cpu, &vulkan).unwrap_err();
 
         assert_eq!(error, "CPU optimizer did not reduce loss: 1 -> 1");
+    }
+
+    #[test]
+    fn accepts_uninterrupted_and_checkpoint_resumed_parity() {
+        let cpu = checkpoint_result(0.01);
+        let vulkan = checkpoint_result(0.010_000_1);
+
+        check_optimizer_checkpoint_parity(&cpu, &vulkan).unwrap();
+    }
+
+    #[test]
+    fn rejects_checkpoint_resume_divergence() {
+        let cpu = checkpoint_result(0.1);
+        let vulkan = checkpoint_result(0.01);
+
+        let error = check_optimizer_checkpoint_parity(&cpu, &vulkan).unwrap_err();
+
+        assert!(error.starts_with(
+            "CPU uninterrupted/CPU resumed optimizer loss trajectory differs at index 1"
+        ));
     }
 
     #[test]
@@ -1363,6 +1467,15 @@ Vulkan compute capabilities:
             losses: vec![1.0, final_loss],
             final_weights: vec![0.6, -0.01],
             final_bias: vec![0.2],
+        }
+    }
+
+    fn checkpoint_result(resumed_final_loss: f32) -> OptimizerCheckpointProbeResult {
+        OptimizerCheckpointProbeResult {
+            uninterrupted: optimizer_result(0.01),
+            resumed: optimizer_result(resumed_final_loss),
+            model_checkpoint_bytes: 100,
+            optimizer_checkpoint_bytes: 200,
         }
     }
 }
