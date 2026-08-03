@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full-precision model and stateful momentum-SGD checkpoint round trip after
   step 10, with uninterrupted/resumed and CPU/Vulkan trajectory and parameter
   parity checks.
+- Deterministic two-layer tanh training for a nonlinear product target, with
+  full-parameter CPU/Vulkan and serialized checkpoint/resume parity.
 
 ### Fixed
 

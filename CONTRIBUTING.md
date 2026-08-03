@@ -72,7 +72,9 @@ and optimizer with full precision, restore both into fresh instances, and
 compare the complete resumed trajectory and final parameters with uninterrupted
 training on CPU and Vulkan. The current stateful protocol checkpoints after
 step 10 of 20 using SGD momentum `0.9`, dampening `0.1`, and no Nesterov
-momentum.
+momentum. Model changes must exercise both the fixed linear probe and the
+`2 -> 3 -> 1` tanh probe for the nonlinear product target, including every
+parameter in uninterrupted/resumed and CPU/Vulkan comparisons.
 
 ## Compatibility and releases
 

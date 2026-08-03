@@ -63,6 +63,14 @@ resumed loss trajectories and final parameters on each backend, then compares
 the resumed CPU and Vulkan results. It also reports the two in-memory
 checkpoint sizes; no checkpoint artifact is written to the repository.
 
+The checkpoint protocol also runs a fixed two-layer `2 -> 3 -> 1` tanh model
+against the nonlinear target `y = x1 * x2` for the four signed unit inputs.
+It uses the same update count, learning rate, momentum settings, checkpoint
+step, recorder, and uninterrupted/resumed comparisons, then checks the complete
+loss trajectory and every parameter across CPU and Vulkan. This extends the
+compatibility evidence beyond a single affine layer without introducing random
+initialization or data ordering.
+
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
 synchronization, and host readback is excluded. The report records the build
@@ -119,15 +127,17 @@ Vulkan optimizer final weights: [0.64024514, -0.012434009]
 Vulkan optimizer final bias: [0.20990893]
 Vulkan checkpoint/resume loss: 0.92354155 -> 0.13259129 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10 (momentum 0.9, dampening 0.1)
 Vulkan checkpoint size: model 321 bytes, optimizer 351 bytes
+Vulkan nonlinear checkpoint/resume loss: 1.0672634 -> 0.9552125 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10 (momentum 0.9, dampening 0.1)
+Vulkan nonlinear checkpoint size: model 492 bytes, optimizer 536 bytes
 Vulkan custom quadratic output: [2.0, -0.25, 0.0, 3.75]
 Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 ```
 
 ## Near-term roadmap
 
-- Extend deterministic CPU/Vulkan training and checkpoint parity to a small
-  nonlinear model. The quadratic experiments do not justify lower-level
-  Vulkan interoperability.
+- Add deterministic mini-batch ordering and checkpoint the data-position state
+  alongside the model and optimizer. The quadratic experiments do not justify
+  lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.
