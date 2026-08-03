@@ -14,11 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, CustomOpsBackend, OPTIMIZER_CHECKPOINT_DAMPENING,
-    OPTIMIZER_CHECKPOINT_MOMENTUM, OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_LEARNING_RATE,
-    OPTIMIZER_PROBE_STEPS, OptimizerCheckpointProbeResult, OptimizerProbeResult, ProbeError,
-    QuadraticTrainingPath, TrainingProbeResult, quadratic, quadratic_reference, run_autodiff_probe,
-    run_custom_op_probe, run_optimizer_checkpoint_probe, run_optimizer_probe,
+    CustomOpProbeResult, CustomOpsBackend, NonlinearCheckpointProbeResult,
+    NonlinearOptimizerProbeResult, OPTIMIZER_CHECKPOINT_DAMPENING, OPTIMIZER_CHECKPOINT_MOMENTUM,
+    OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS,
+    OptimizerCheckpointProbeResult, OptimizerProbeResult, ProbeError, QuadraticTrainingPath,
+    TrainingProbeResult, quadratic, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+    run_nonlinear_checkpoint_probe, run_optimizer_checkpoint_probe, run_optimizer_probe,
     run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
     run_training_probe,
 };
@@ -519,6 +520,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vulkan_checkpoint_result =
         run_optimizer_checkpoint_probe::<VulkanAutodiffBackend>(&device)?;
     check_optimizer_checkpoint_parity(&cpu_checkpoint_result, &vulkan_checkpoint_result)?;
+    let cpu_nonlinear_checkpoint_result =
+        run_nonlinear_checkpoint_probe::<CpuBackend>(&FlexDevice)?;
+    let vulkan_nonlinear_checkpoint_result =
+        run_nonlinear_checkpoint_probe::<VulkanAutodiffBackend>(&device)?;
+    check_nonlinear_checkpoint_parity(
+        &cpu_nonlinear_checkpoint_result,
+        &vulkan_nonlinear_checkpoint_result,
+    )?;
     let cpu_custom_result = run_custom_op_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_custom_result = run_custom_op_probe::<VulkanAutodiffBackend>(&device)?;
     check_custom_op_parity(&cpu_custom_result, &vulkan_custom_result)?;
@@ -547,6 +556,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "CPU/Vulkan training parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
     print_optimizer_results(&vulkan_optimizer_result, &vulkan_checkpoint_result);
+    print_nonlinear_checkpoint_results(&vulkan_nonlinear_checkpoint_result);
     println!(
         "Vulkan custom quadratic output: {:?}",
         vulkan_custom_result.output
@@ -591,6 +601,24 @@ fn print_optimizer_results(
     );
     println!(
         "CPU/Vulkan uninterrupted and checkpoint-resumed parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+    );
+}
+
+fn print_nonlinear_checkpoint_results(checkpoint: &NonlinearCheckpointProbeResult) {
+    println!(
+        "Vulkan nonlinear checkpoint/resume loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} momentum SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}; checkpoint restored after step {OPTIMIZER_CHECKPOINT_STEP} (momentum {OPTIMIZER_CHECKPOINT_MOMENTUM}, dampening {OPTIMIZER_CHECKPOINT_DAMPENING})",
+        checkpoint.resumed.losses[0], checkpoint.resumed.losses[OPTIMIZER_PROBE_STEPS]
+    );
+    println!(
+        "Vulkan nonlinear final parameters: {:?}",
+        checkpoint.resumed.final_parameters
+    );
+    println!(
+        "Vulkan nonlinear checkpoint size: model {} bytes, optimizer {} bytes",
+        checkpoint.model_checkpoint_bytes, checkpoint.optimizer_checkpoint_bytes
+    );
+    println!(
+        "CPU/Vulkan nonlinear uninterrupted and checkpoint-resumed parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
 }
 
@@ -1021,6 +1049,34 @@ fn check_optimizer_checkpoint_parity(
     )
 }
 
+fn check_nonlinear_checkpoint_parity(
+    cpu: &NonlinearCheckpointProbeResult,
+    vulkan: &NonlinearCheckpointProbeResult,
+) -> Result<(), String> {
+    check_nonlinear_loss_reduction("CPU uninterrupted", &cpu.uninterrupted)?;
+    check_nonlinear_loss_reduction("CPU resumed", &cpu.resumed)?;
+    check_nonlinear_loss_reduction("Vulkan uninterrupted", &vulkan.uninterrupted)?;
+    check_nonlinear_loss_reduction("Vulkan resumed", &vulkan.resumed)?;
+    check_nonlinear_optimizer_results(
+        "CPU uninterrupted",
+        &cpu.uninterrupted,
+        "CPU resumed",
+        &cpu.resumed,
+    )?;
+    check_nonlinear_optimizer_results(
+        "Vulkan uninterrupted",
+        &vulkan.uninterrupted,
+        "Vulkan resumed",
+        &vulkan.resumed,
+    )?;
+    check_nonlinear_optimizer_results(
+        "CPU resumed",
+        &cpu.resumed,
+        "Vulkan resumed",
+        &vulkan.resumed,
+    )
+}
+
 fn check_optimizer_results(
     left_name: &str,
     left: &OptimizerProbeResult,
@@ -1051,8 +1107,41 @@ fn check_optimizer_results(
     Ok(())
 }
 
+fn check_nonlinear_optimizer_results(
+    left_name: &str,
+    left: &NonlinearOptimizerProbeResult,
+    right_name: &str,
+    right: &NonlinearOptimizerProbeResult,
+) -> Result<(), String> {
+    check_named_values(
+        "nonlinear optimizer loss trajectory",
+        left_name,
+        &left.losses,
+        right_name,
+        &right.losses,
+    )?;
+    check_named_values(
+        "nonlinear optimizer final parameters",
+        left_name,
+        &left.final_parameters,
+        right_name,
+        &right.final_parameters,
+    )
+}
+
 fn check_loss_reduction(backend: &str, result: &OptimizerProbeResult) -> Result<(), String> {
-    let Some((&initial_loss, remaining_losses)) = result.losses.split_first() else {
+    check_loss_trajectory_reduction(backend, &result.losses)
+}
+
+fn check_nonlinear_loss_reduction(
+    backend: &str,
+    result: &NonlinearOptimizerProbeResult,
+) -> Result<(), String> {
+    check_loss_trajectory_reduction(backend, &result.losses)
+}
+
+fn check_loss_trajectory_reduction(backend: &str, losses: &[f32]) -> Result<(), String> {
+    let Some((&initial_loss, remaining_losses)) = losses.split_first() else {
         return Err(format!("{backend} optimizer loss trajectory is empty"));
     };
     let Some(&final_loss) = remaining_losses.last() else {
@@ -1132,10 +1221,14 @@ mod tests {
         CustomTimingMeasurement, CustomTrainingTimingMeasurement, TIMING_SCOPE,
         TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult, VulkanAdapterReport,
         VulkanCustomTimingReport, VulkanCustomTrainingTimingReport,
-        check_optimizer_checkpoint_parity, check_optimizer_parity, check_training_parity,
-        custom_benchmark_order, quadratic_training_order, timing_report,
+        check_nonlinear_checkpoint_parity, check_optimizer_checkpoint_parity,
+        check_optimizer_parity, check_training_parity, custom_benchmark_order,
+        quadratic_training_order, timing_report,
     };
-    use vulkan_ai::{OptimizerCheckpointProbeResult, OptimizerProbeResult, QuadraticTrainingPath};
+    use vulkan_ai::{
+        NonlinearCheckpointProbeResult, NonlinearOptimizerProbeResult,
+        OptimizerCheckpointProbeResult, OptimizerProbeResult, QuadraticTrainingPath,
+    };
 
     #[test]
     fn formats_vulkan_adapter_report() {
@@ -1251,6 +1344,27 @@ Vulkan compute capabilities:
 
         assert!(error.starts_with(
             "CPU uninterrupted/CPU resumed optimizer loss trajectory differs at index 1"
+        ));
+    }
+
+    #[test]
+    fn accepts_nonlinear_uninterrupted_and_checkpoint_resumed_parity() {
+        let cpu = nonlinear_checkpoint_result(0.95);
+        let vulkan = nonlinear_checkpoint_result(0.950_001);
+
+        check_nonlinear_checkpoint_parity(&cpu, &vulkan).unwrap();
+    }
+
+    #[test]
+    fn rejects_nonlinear_checkpoint_parameter_divergence() {
+        let cpu = nonlinear_checkpoint_result(0.95);
+        let mut vulkan = nonlinear_checkpoint_result(0.95);
+        vulkan.resumed.final_parameters[0] = 0.1;
+
+        let error = check_nonlinear_checkpoint_parity(&cpu, &vulkan).unwrap_err();
+
+        assert!(error.starts_with(
+            "Vulkan uninterrupted/Vulkan resumed nonlinear optimizer final parameters differs at index 0"
         ));
     }
 
@@ -1476,6 +1590,24 @@ Vulkan compute capabilities:
             resumed: optimizer_result(resumed_final_loss),
             model_checkpoint_bytes: 100,
             optimizer_checkpoint_bytes: 200,
+        }
+    }
+
+    fn nonlinear_checkpoint_result(resumed_final_loss: f32) -> NonlinearCheckpointProbeResult {
+        NonlinearCheckpointProbeResult {
+            uninterrupted: nonlinear_optimizer_result(0.95),
+            resumed: nonlinear_optimizer_result(resumed_final_loss),
+            model_checkpoint_bytes: 300,
+            optimizer_checkpoint_bytes: 400,
+        }
+    }
+
+    fn nonlinear_optimizer_result(final_loss: f32) -> NonlinearOptimizerProbeResult {
+        NonlinearOptimizerProbeResult {
+            losses: vec![1.0, final_loss],
+            final_parameters: vec![
+                0.2, -0.3, 0.4, -0.1, 0.5, 0.3, 0.1, -0.2, 0.05, 0.3, -0.4, 0.2, 0.0,
+            ],
         }
     }
 }

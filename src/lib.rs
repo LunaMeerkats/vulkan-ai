@@ -5,14 +5,17 @@
 mod ops;
 
 use burn::{
-    module::{Module, Param},
+    module::{AutodiffModule, Module, Param},
     nn::{
         Linear,
         loss::{MseLoss, Reduction},
     },
     optim::{GradientsParams, Optimizer, SgdConfig, momentum::MomentumConfig},
     record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder},
-    tensor::{Tensor, backend::AutodiffBackend},
+    tensor::{
+        Tensor,
+        backend::{AutodiffBackend, Backend},
+    },
 };
 use std::{error::Error, fmt};
 
@@ -64,6 +67,63 @@ pub struct OptimizerCheckpointProbeResult {
     pub optimizer_checkpoint_bytes: usize,
 }
 
+/// Values produced by deterministic multi-step nonlinear-model training.
+#[derive(Debug, PartialEq)]
+pub struct NonlinearOptimizerProbeResult {
+    /// Mean squared error before training and after every optimizer step.
+    pub losses: Vec<f32>,
+    /// Final hidden weights, hidden bias, output weights, and output bias in that order.
+    pub final_parameters: Vec<f32>,
+}
+
+/// Values produced by uninterrupted and checkpoint-resumed nonlinear training.
+#[derive(Debug, PartialEq)]
+pub struct NonlinearCheckpointProbeResult {
+    /// Result from training straight through without interruption.
+    pub uninterrupted: NonlinearOptimizerProbeResult,
+    /// Result from serializing and restoring the model and optimizer mid-run.
+    pub resumed: NonlinearOptimizerProbeResult,
+    /// Size of the full-precision named `MessagePack` model checkpoint.
+    pub model_checkpoint_bytes: usize,
+    /// Size of the full-precision named `MessagePack` optimizer checkpoint.
+    pub optimizer_checkpoint_bytes: usize,
+}
+
+#[derive(Module, Debug)]
+struct NonlinearModel<B: Backend> {
+    hidden: Linear<B>,
+    output: Linear<B>,
+}
+
+impl<B: Backend> NonlinearModel<B> {
+    fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.output.forward(self.hidden.forward(input).tanh())
+    }
+}
+
+trait OptimizerProbeModel<B: AutodiffBackend>: AutodiffModule<B> {
+    fn probe_forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2>;
+}
+
+impl<B: AutodiffBackend> OptimizerProbeModel<B> for Linear<B> {
+    fn probe_forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(input)
+    }
+}
+
+impl<B: AutodiffBackend> OptimizerProbeModel<B> for NonlinearModel<B> {
+    fn probe_forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.forward(input)
+    }
+}
+
+struct CheckpointProbeExecution<R> {
+    uninterrupted: R,
+    resumed: R,
+    model_checkpoint_bytes: usize,
+    optimizer_checkpoint_bytes: usize,
+}
+
 /// Number of full-batch SGD updates used by [`run_optimizer_probe`].
 pub const OPTIMIZER_PROBE_STEPS: usize = 20;
 /// Learning rate used by [`run_optimizer_probe`].
@@ -102,6 +162,8 @@ pub enum ProbeError {
     MissingBiasGradient,
     /// The deterministic linear model did not contain its expected bias parameter.
     MissingBiasParameter,
+    /// A layer in the deterministic nonlinear model did not contain its expected bias.
+    MissingNonlinearBiasParameter(&'static str),
     /// The autodiff backend did not return the custom operation's input gradient.
     MissingInputGradient,
     /// Tensor data could not be converted to the expected `f32` values.
@@ -123,6 +185,12 @@ impl fmt::Display for ProbeError {
             }
             Self::MissingBiasParameter => {
                 formatter.write_str("the deterministic linear model bias is missing")
+            }
+            Self::MissingNonlinearBiasParameter(layer) => {
+                write!(
+                    formatter,
+                    "the deterministic nonlinear model {layer} bias is missing"
+                )
             }
             Self::MissingInputGradient => {
                 formatter.write_str("the custom operation input gradient is missing")
@@ -328,26 +396,88 @@ where
     B: AutodiffBackend<FloatElem = f32>,
 {
     let (input, target) = training_batch::<B>(device);
-
-    let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, Linear<B>>();
-    let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
-    let uninterrupted_model = run_optimizer_updates(
-        training_model::<B>(device),
-        &mut uninterrupted_optimizer,
+    let execution = execute_checkpoint_probe(
+        device,
         &input,
         &target,
+        training_model::<B>,
+        optimizer_probe_result,
+    )?;
+
+    Ok(OptimizerCheckpointProbeResult {
+        uninterrupted: execution.uninterrupted,
+        resumed: execution.resumed,
+        model_checkpoint_bytes: execution.model_checkpoint_bytes,
+        optimizer_checkpoint_bytes: execution.optimizer_checkpoint_bytes,
+    })
+}
+
+/// Compare uninterrupted nonlinear training with a serialized checkpoint/resume run.
+///
+/// The fixed two-layer tanh model learns a product target that a single linear
+/// layer cannot represent. Both paths reuse the established 20-step stateful
+/// SGD protocol, checkpoint after step 10, and record the complete loss
+/// trajectory plus every trainable parameter.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] if tensor data cannot be read, a layer is missing its
+/// bias, or either checkpoint cannot be serialized or restored.
+pub fn run_nonlinear_checkpoint_probe<B>(
+    device: &B::Device,
+) -> Result<NonlinearCheckpointProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    let (input, target) = nonlinear_training_batch::<B>(device);
+    let execution = execute_checkpoint_probe(
+        device,
+        &input,
+        &target,
+        nonlinear_training_model::<B>,
+        nonlinear_optimizer_probe_result,
+    )?;
+
+    Ok(NonlinearCheckpointProbeResult {
+        uninterrupted: execution.uninterrupted,
+        resumed: execution.resumed,
+        model_checkpoint_bytes: execution.model_checkpoint_bytes,
+        optimizer_checkpoint_bytes: execution.optimizer_checkpoint_bytes,
+    })
+}
+
+fn execute_checkpoint_probe<B, M, R, F, G>(
+    device: &B::Device,
+    input: &Tensor<B, 2>,
+    target: &Tensor<B, 2>,
+    model_factory: F,
+    result_factory: G,
+) -> Result<CheckpointProbeExecution<R>, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+    M: OptimizerProbeModel<B>,
+    F: Fn(&B::Device) -> M,
+    G: Fn(&M, Vec<f32>) -> Result<R, ProbeError>,
+{
+    let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, M>();
+    let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
+    let uninterrupted_model = run_optimizer_updates(
+        model_factory(device),
+        &mut uninterrupted_optimizer,
+        input,
+        target,
         OPTIMIZER_PROBE_STEPS,
         &mut uninterrupted_losses,
     )?;
-    let uninterrupted = optimizer_probe_result(&uninterrupted_model, uninterrupted_losses)?;
+    let uninterrupted = result_factory(&uninterrupted_model, uninterrupted_losses)?;
 
-    let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, Linear<B>>();
+    let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, M>();
     let mut resumed_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let resumed_model = run_optimizer_updates(
-        training_model::<B>(device),
+        model_factory(device),
         &mut resumed_optimizer,
-        &input,
-        &target,
+        input,
+        target,
         OPTIMIZER_CHECKPOINT_STEP,
         &mut resumed_losses,
     )?;
@@ -363,24 +493,24 @@ where
 
     let restored_model_record = Recorder::<B>::load(&recorder, model_checkpoint, device)
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
-    let restored_model = training_model::<B>(device).load_record(restored_model_record);
+    let restored_model = model_factory(device).load_record(restored_model_record);
     let restored_optimizer_record = Recorder::<B>::load(&recorder, optimizer_checkpoint, device)
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
     let mut restored_optimizer = checkpoint_optimizer_config()
-        .init::<B, Linear<B>>()
+        .init::<B, M>()
         .load_record(restored_optimizer_record);
 
     let resumed_model = run_optimizer_updates(
         restored_model,
         &mut restored_optimizer,
-        &input,
-        &target,
+        input,
+        target,
         OPTIMIZER_PROBE_STEPS - OPTIMIZER_CHECKPOINT_STEP,
         &mut resumed_losses,
     )?;
-    let resumed = optimizer_probe_result(&resumed_model, resumed_losses)?;
+    let resumed = result_factory(&resumed_model, resumed_losses)?;
 
-    Ok(OptimizerCheckpointProbeResult {
+    Ok(CheckpointProbeExecution {
         uninterrupted,
         resumed,
         model_checkpoint_bytes,
@@ -396,20 +526,21 @@ fn checkpoint_optimizer_config() -> SgdConfig {
     }))
 }
 
-fn run_optimizer_updates<B, O>(
-    mut model: Linear<B>,
+fn run_optimizer_updates<B, M, O>(
+    mut model: M,
     optimizer: &mut O,
     input: &Tensor<B, 2>,
     target: &Tensor<B, 2>,
     steps: usize,
     losses: &mut Vec<f32>,
-) -> Result<Linear<B>, ProbeError>
+) -> Result<M, ProbeError>
 where
     B: AutodiffBackend<FloatElem = f32>,
-    O: Optimizer<Linear<B>, B>,
+    M: OptimizerProbeModel<B>,
+    O: Optimizer<M, B>,
 {
     let mut loss = MseLoss::new().forward(
-        model.forward(input.clone()),
+        model.probe_forward(input.clone()),
         target.clone(),
         Reduction::Mean,
     );
@@ -422,7 +553,7 @@ where
         let gradients = GradientsParams::from_grads(gradients, &model);
         model = optimizer.step(OPTIMIZER_PROBE_LEARNING_RATE, model, gradients);
         loss = MseLoss::new().forward(
-            model.forward(input.clone()),
+            model.probe_forward(input.clone()),
             target.clone(),
             Reduction::Mean,
         );
@@ -471,6 +602,48 @@ where
         final_weights,
         final_bias,
     })
+}
+
+fn nonlinear_optimizer_probe_result<B>(
+    model: &NonlinearModel<B>,
+    losses: Vec<f32>,
+) -> Result<NonlinearOptimizerProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    let mut final_parameters = read_values(model.hidden.weight.val())?;
+    final_parameters.extend(read_values(
+        model
+            .hidden
+            .bias
+            .as_ref()
+            .ok_or(ProbeError::MissingNonlinearBiasParameter("hidden-layer"))?
+            .val(),
+    )?);
+    final_parameters.extend(read_values(model.output.weight.val())?);
+    final_parameters.extend(read_values(
+        model
+            .output
+            .bias
+            .as_ref()
+            .ok_or(ProbeError::MissingNonlinearBiasParameter("output-layer"))?
+            .val(),
+    )?);
+
+    Ok(NonlinearOptimizerProbeResult {
+        losses,
+        final_parameters,
+    })
+}
+
+fn read_values<B, const D: usize>(tensor: Tensor<B, D>) -> Result<Vec<f32>, ProbeError>
+where
+    B: Backend<FloatElem = f32>,
+{
+    tensor
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| ProbeError::DataConversion(error.to_string()))
 }
 
 /// Run the deterministic training workload and wait for backend completion.
@@ -578,6 +751,41 @@ where
     }
 }
 
+fn nonlinear_training_batch<B>(device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 2>)
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    (
+        Tensor::<B, 2>::from_floats([[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]], device),
+        Tensor::<B, 2>::from_floats([[1.0], [-1.0], [-1.0], [1.0]], device),
+    )
+}
+
+fn nonlinear_training_model<B>(device: &B::Device) -> NonlinearModel<B>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    NonlinearModel {
+        hidden: Linear {
+            weight: Param::from_tensor(Tensor::<B, 2>::from_floats(
+                [[0.4, -0.3, 0.2], [-0.2, 0.5, 0.3]],
+                device,
+            )),
+            bias: Some(Param::from_tensor(Tensor::<B, 1>::from_floats(
+                [0.1, -0.1, 0.05],
+                device,
+            ))),
+        },
+        output: Linear {
+            weight: Param::from_tensor(Tensor::<B, 2>::from_floats([[0.3], [-0.4], [0.2]], device)),
+            bias: Some(Param::from_tensor(Tensor::<B, 1>::from_floats(
+                [0.0],
+                device,
+            ))),
+        },
+    }
+}
+
 #[cfg(all(test, feature = "cpu"))]
 mod tests {
     use burn::{
@@ -588,9 +796,9 @@ mod tests {
     use super::{
         CustomOpProbeResult, OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_STEPS, ProbeResult,
         QuadraticTrainingPath, TrainingProbeResult, quadratic_reference, run_autodiff_probe,
-        run_custom_op_probe, run_optimizer_checkpoint_probe, run_optimizer_probe,
-        run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
-        run_training_probe,
+        run_custom_op_probe, run_nonlinear_checkpoint_probe, run_optimizer_checkpoint_probe,
+        run_optimizer_probe, run_synchronized_quadratic_training_workload,
+        run_synchronized_training_workload, run_training_probe,
     };
 
     #[test]
@@ -653,6 +861,44 @@ mod tests {
         assert!(result.optimizer_checkpoint_bytes > 0);
         assert!(
             result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS] < result.uninterrupted.losses[0]
+        );
+    }
+
+    #[test]
+    fn nonlinear_checkpoint_resume_matches_uninterrupted_training() {
+        type Backend = Autodiff<Flex>;
+
+        let result = run_nonlinear_checkpoint_probe::<Backend>(&FlexDevice).unwrap();
+
+        assert_eq!(result.uninterrupted.losses.len(), OPTIMIZER_PROBE_STEPS + 1);
+        assert_eq!(result.uninterrupted, result.resumed);
+        assert!(result.model_checkpoint_bytes > 0);
+        assert!(result.optimizer_checkpoint_bytes > 0);
+        assert!(
+            result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS] < result.uninterrupted.losses[0]
+        );
+        assert_values_close(&[result.uninterrupted.losses[0]], &[1.067_263_4]);
+        assert_values_close(
+            &[result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS]],
+            &[0.955_212_5],
+        );
+        assert_values_close(
+            &result.uninterrupted.final_parameters,
+            &[
+                0.229_769_95,
+                -0.345_785_77,
+                -0.026_133_817,
+                -0.172_173_17,
+                0.504_222_5,
+                0.426_487_74,
+                0.244_003_82,
+                -0.537_556_05,
+                -0.082_056,
+                -0.063_568_816,
+                -0.292_702_76,
+                0.184_942_65,
+                -0.015_700_676,
+            ],
         );
     }
 
