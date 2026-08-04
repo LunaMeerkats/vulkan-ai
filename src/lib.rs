@@ -11,7 +11,7 @@ use burn::{
         loss::{MseLoss, Reduction},
     },
     optim::{GradientsParams, Optimizer, SgdConfig, momentum::MomentumConfig},
-    record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder},
+    record::{FullPrecisionSettings, NamedMpkBytesRecorder, Record, Recorder},
     tensor::{
         Tensor,
         backend::{AutodiffBackend, Backend},
@@ -89,6 +89,36 @@ pub struct NonlinearCheckpointProbeResult {
     pub optimizer_checkpoint_bytes: usize,
 }
 
+/// Values produced by deterministic nonlinear mini-batch training.
+#[derive(Debug, PartialEq)]
+pub struct MiniBatchOptimizerProbeResult {
+    /// Full-dataset mean squared error before training and after every optimizer step.
+    pub losses: Vec<f32>,
+    /// Mini-batch identifiers consumed by each optimizer step.
+    pub batch_sequence: Vec<usize>,
+    /// Final hidden weights, hidden bias, output weights, and output bias in that order.
+    pub final_parameters: Vec<f32>,
+    /// Position of the next mini-batch in the deterministic schedule.
+    pub final_data_position: usize,
+}
+
+/// Values produced by uninterrupted and checkpoint-resumed mini-batch training.
+#[derive(Debug, PartialEq)]
+pub struct MiniBatchCheckpointProbeResult {
+    /// Result from training straight through without interruption.
+    pub uninterrupted: MiniBatchOptimizerProbeResult,
+    /// Result from restoring model, optimizer, and data-position state mid-run.
+    pub resumed: MiniBatchOptimizerProbeResult,
+    /// Size of the full-precision named `MessagePack` model checkpoint.
+    pub model_checkpoint_bytes: usize,
+    /// Size of the full-precision named `MessagePack` optimizer checkpoint.
+    pub optimizer_checkpoint_bytes: usize,
+    /// Size of the named `MessagePack` data-position checkpoint.
+    pub data_checkpoint_bytes: usize,
+    /// Schedule position restored after the checkpoint.
+    pub checkpoint_data_position: usize,
+}
+
 #[derive(Module, Debug)]
 struct NonlinearModel<B: Backend> {
     hidden: Linear<B>,
@@ -124,6 +154,11 @@ struct CheckpointProbeExecution<R> {
     optimizer_checkpoint_bytes: usize,
 }
 
+#[derive(Record, Clone, Debug, Default, PartialEq, Eq)]
+struct MiniBatchDataState {
+    next_position: usize,
+}
+
 /// Number of full-batch SGD updates used by [`run_optimizer_probe`].
 pub const OPTIMIZER_PROBE_STEPS: usize = 20;
 /// Learning rate used by [`run_optimizer_probe`].
@@ -134,6 +169,7 @@ pub const OPTIMIZER_CHECKPOINT_STEP: usize = OPTIMIZER_PROBE_STEPS / 2;
 pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
 /// Dampening factor used by the stateful checkpoint/resume probe.
 pub const OPTIMIZER_CHECKPOINT_DAMPENING: f64 = 0.1;
+const MINI_BATCH_ORDER: [usize; 4] = [0, 1, 1, 0];
 
 /// Values produced by the custom quadratic operation and its backward rule.
 #[derive(Debug, PartialEq)]
@@ -170,6 +206,8 @@ pub enum ProbeError {
     DataConversion(String),
     /// Model or optimizer state could not be serialized or restored.
     CheckpointSerialization(String),
+    /// Restored mini-batch state did not identify a valid schedule position.
+    InvalidMiniBatchPosition(usize),
     /// The backend could not synchronize a measured workload.
     Synchronization(String),
     /// `CubeCL` could not profile a measured workload consistently.
@@ -202,6 +240,12 @@ impl fmt::Display for ProbeError {
                 write!(
                     formatter,
                     "could not round-trip checkpoint state: {message}"
+                )
+            }
+            Self::InvalidMiniBatchPosition(position) => {
+                write!(
+                    formatter,
+                    "mini-batch data position {position} is outside the deterministic schedule"
                 )
             }
             Self::Synchronization(message) => {
@@ -446,6 +490,120 @@ where
     })
 }
 
+/// Compare uninterrupted mini-batch training with a complete checkpoint/resume run.
+///
+/// The nonlinear dataset is split into two fixed two-example batches. Their
+/// deterministic four-step schedule alternates epoch order, so the checkpoint
+/// after step 10 resumes from a different position than a fresh run. The
+/// resumed path records and restores the data position alongside the model and
+/// optimizer, then compares the full-dataset loss trajectory, consumed batch
+/// sequence, final parameters, and final data position with uninterrupted
+/// training.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] if tensor data cannot be read, a layer is missing its
+/// bias, checkpoint state cannot be serialized or restored, or a restored data
+/// position is outside the deterministic schedule.
+pub fn run_minibatch_checkpoint_probe<B>(
+    device: &B::Device,
+) -> Result<MiniBatchCheckpointProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    let (evaluation_input, evaluation_target) = nonlinear_training_batch::<B>(device);
+
+    let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
+    let mut uninterrupted_state = MiniBatchDataState::default();
+    let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
+    let mut uninterrupted_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
+    let uninterrupted_model = run_minibatch_optimizer_updates(
+        nonlinear_training_model::<B>(device),
+        &mut uninterrupted_optimizer,
+        &mut uninterrupted_state,
+        &evaluation_input,
+        &evaluation_target,
+        device,
+        OPTIMIZER_PROBE_STEPS,
+        &mut uninterrupted_losses,
+        &mut uninterrupted_batches,
+    )?;
+    let uninterrupted = minibatch_optimizer_probe_result(
+        &uninterrupted_model,
+        uninterrupted_losses,
+        uninterrupted_batches,
+        uninterrupted_state.next_position,
+    )?;
+
+    let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
+    let mut resumed_state = MiniBatchDataState::default();
+    let mut resumed_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
+    let mut resumed_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
+    let resumed_model = run_minibatch_optimizer_updates(
+        nonlinear_training_model::<B>(device),
+        &mut resumed_optimizer,
+        &mut resumed_state,
+        &evaluation_input,
+        &evaluation_target,
+        device,
+        OPTIMIZER_CHECKPOINT_STEP,
+        &mut resumed_losses,
+        &mut resumed_batches,
+    )?;
+
+    let recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
+    let model_checkpoint =
+        Recorder::<B>::record(&recorder, resumed_model.clone().into_record(), ())
+            .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let optimizer_checkpoint = Recorder::<B>::record(&recorder, resumed_optimizer.to_record(), ())
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let data_checkpoint = Recorder::<B>::record(&recorder, resumed_state.clone(), ())
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let model_checkpoint_bytes = model_checkpoint.len();
+    let optimizer_checkpoint_bytes = optimizer_checkpoint.len();
+    let data_checkpoint_bytes = data_checkpoint.len();
+    let checkpoint_data_position = resumed_state.next_position;
+
+    let restored_model_record = Recorder::<B>::load(&recorder, model_checkpoint, device)
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let restored_model = nonlinear_training_model::<B>(device).load_record(restored_model_record);
+    let restored_optimizer_record = Recorder::<B>::load(&recorder, optimizer_checkpoint, device)
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let mut restored_optimizer = checkpoint_optimizer_config()
+        .init::<B, NonlinearModel<B>>()
+        .load_record(restored_optimizer_record);
+    let mut restored_state: MiniBatchDataState =
+        Recorder::<B>::load(&recorder, data_checkpoint, device)
+            .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+
+    let resumed_model = run_minibatch_optimizer_updates(
+        restored_model,
+        &mut restored_optimizer,
+        &mut restored_state,
+        &evaluation_input,
+        &evaluation_target,
+        device,
+        OPTIMIZER_PROBE_STEPS - OPTIMIZER_CHECKPOINT_STEP,
+        &mut resumed_losses,
+        &mut resumed_batches,
+    )?;
+    let resumed = minibatch_optimizer_probe_result(
+        &resumed_model,
+        resumed_losses,
+        resumed_batches,
+        restored_state.next_position,
+    )?;
+
+    Ok(MiniBatchCheckpointProbeResult {
+        uninterrupted,
+        resumed,
+        model_checkpoint_bytes,
+        optimizer_checkpoint_bytes,
+        data_checkpoint_bytes,
+        checkpoint_data_position,
+    })
+}
+
 fn execute_checkpoint_probe<B, M, R, F, G>(
     device: &B::Device,
     input: &Tensor<B, 2>,
@@ -563,6 +721,54 @@ where
     Ok(model)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_minibatch_optimizer_updates<B, O>(
+    mut model: NonlinearModel<B>,
+    optimizer: &mut O,
+    data_state: &mut MiniBatchDataState,
+    evaluation_input: &Tensor<B, 2>,
+    evaluation_target: &Tensor<B, 2>,
+    device: &B::Device,
+    steps: usize,
+    losses: &mut Vec<f32>,
+    batch_sequence: &mut Vec<usize>,
+) -> Result<NonlinearModel<B>, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+    O: Optimizer<NonlinearModel<B>, B>,
+{
+    if losses.is_empty() {
+        losses.push(read_loss(MseLoss::new().forward(
+            model.forward(evaluation_input.clone()),
+            evaluation_target.clone(),
+            Reduction::Mean,
+        ))?);
+    }
+
+    for _ in 0..steps {
+        let Some(&batch_index) = MINI_BATCH_ORDER.get(data_state.next_position) else {
+            return Err(ProbeError::InvalidMiniBatchPosition(
+                data_state.next_position,
+            ));
+        };
+        let (input, target) = nonlinear_mini_batch::<B>(batch_index, device);
+        let loss = MseLoss::new().forward(model.forward(input), target, Reduction::Mean);
+        let gradients = loss.backward();
+        let gradients = GradientsParams::from_grads(gradients, &model);
+        model = optimizer.step(OPTIMIZER_PROBE_LEARNING_RATE, model, gradients);
+        batch_sequence.push(batch_index);
+        data_state.next_position = (data_state.next_position + 1) % MINI_BATCH_ORDER.len();
+
+        losses.push(read_loss(MseLoss::new().forward(
+            model.forward(evaluation_input.clone()),
+            evaluation_target.clone(),
+            Reduction::Mean,
+        ))?);
+    }
+
+    Ok(model)
+}
+
 fn read_loss<B>(loss: Tensor<B, 1>) -> Result<f32, ProbeError>
 where
     B: AutodiffBackend<FloatElem = f32>,
@@ -611,8 +817,35 @@ fn nonlinear_optimizer_probe_result<B>(
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
-    let mut final_parameters = read_values(model.hidden.weight.val())?;
-    final_parameters.extend(read_values(
+    Ok(NonlinearOptimizerProbeResult {
+        losses,
+        final_parameters: nonlinear_parameters(model)?,
+    })
+}
+
+fn minibatch_optimizer_probe_result<B>(
+    model: &NonlinearModel<B>,
+    losses: Vec<f32>,
+    batch_sequence: Vec<usize>,
+    final_data_position: usize,
+) -> Result<MiniBatchOptimizerProbeResult, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    Ok(MiniBatchOptimizerProbeResult {
+        losses,
+        batch_sequence,
+        final_parameters: nonlinear_parameters(model)?,
+        final_data_position,
+    })
+}
+
+fn nonlinear_parameters<B>(model: &NonlinearModel<B>) -> Result<Vec<f32>, ProbeError>
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    let mut parameters = read_values(model.hidden.weight.val())?;
+    parameters.extend(read_values(
         model
             .hidden
             .bias
@@ -620,8 +853,8 @@ where
             .ok_or(ProbeError::MissingNonlinearBiasParameter("hidden-layer"))?
             .val(),
     )?);
-    final_parameters.extend(read_values(model.output.weight.val())?);
-    final_parameters.extend(read_values(
+    parameters.extend(read_values(model.output.weight.val())?);
+    parameters.extend(read_values(
         model
             .output
             .bias
@@ -629,11 +862,7 @@ where
             .ok_or(ProbeError::MissingNonlinearBiasParameter("output-layer"))?
             .val(),
     )?);
-
-    Ok(NonlinearOptimizerProbeResult {
-        losses,
-        final_parameters,
-    })
+    Ok(parameters)
 }
 
 fn read_values<B, const D: usize>(tensor: Tensor<B, D>) -> Result<Vec<f32>, ProbeError>
@@ -761,6 +990,23 @@ where
     )
 }
 
+fn nonlinear_mini_batch<B>(batch_index: usize, device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 2>)
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    match batch_index {
+        0 => (
+            Tensor::<B, 2>::from_floats([[-1.0, -1.0], [1.0, 1.0]], device),
+            Tensor::<B, 2>::from_floats([[1.0], [1.0]], device),
+        ),
+        1 => (
+            Tensor::<B, 2>::from_floats([[-1.0, 1.0], [1.0, -1.0]], device),
+            Tensor::<B, 2>::from_floats([[-1.0], [-1.0]], device),
+        ),
+        _ => unreachable!("mini-batch identifiers come from the fixed schedule"),
+    }
+}
+
 fn nonlinear_training_model<B>(device: &B::Device) -> NonlinearModel<B>
 where
     B: AutodiffBackend<FloatElem = f32>,
@@ -796,9 +1042,10 @@ mod tests {
     use super::{
         CustomOpProbeResult, OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_STEPS, ProbeResult,
         QuadraticTrainingPath, TrainingProbeResult, quadratic_reference, run_autodiff_probe,
-        run_custom_op_probe, run_nonlinear_checkpoint_probe, run_optimizer_checkpoint_probe,
-        run_optimizer_probe, run_synchronized_quadratic_training_workload,
-        run_synchronized_training_workload, run_training_probe,
+        run_custom_op_probe, run_minibatch_checkpoint_probe, run_nonlinear_checkpoint_probe,
+        run_optimizer_checkpoint_probe, run_optimizer_probe,
+        run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
+        run_training_probe,
     };
 
     #[test]
@@ -898,6 +1145,51 @@ mod tests {
                 -0.292_702_76,
                 0.184_942_65,
                 -0.015_700_676,
+            ],
+        );
+    }
+
+    #[test]
+    fn minibatch_checkpoint_restores_data_position_and_training_state() {
+        type Backend = Autodiff<Flex>;
+
+        let result = run_minibatch_checkpoint_probe::<Backend>(&FlexDevice).unwrap();
+
+        assert_eq!(result.uninterrupted, result.resumed);
+        assert_eq!(result.uninterrupted.losses.len(), OPTIMIZER_PROBE_STEPS + 1);
+        assert_eq!(
+            result.uninterrupted.batch_sequence,
+            [0, 1, 1, 0].repeat(OPTIMIZER_PROBE_STEPS / 4)
+        );
+        assert_eq!(result.checkpoint_data_position, 2);
+        assert_eq!(result.uninterrupted.final_data_position, 0);
+        assert!(result.model_checkpoint_bytes > 0);
+        assert!(result.optimizer_checkpoint_bytes > 0);
+        assert!(result.data_checkpoint_bytes > 0);
+        assert!(
+            result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS] < result.uninterrupted.losses[0]
+        );
+        assert_values_close(&[result.uninterrupted.losses[0]], &[1.067_263_4]);
+        assert_values_close(
+            &[result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS]],
+            &[0.965_475_1],
+        );
+        assert_values_close(
+            &result.uninterrupted.final_parameters,
+            &[
+                0.241_854_15,
+                -0.346_264_4,
+                -0.014_119_865,
+                -0.162_094_79,
+                0.513_146_7,
+                0.440_132_35,
+                0.150_679_38,
+                -0.447_930_66,
+                -0.074_730_776,
+                -0.112_349_58,
+                -0.230_669_89,
+                0.111_102_74,
+                -0.017_807_098,
             ],
         );
     }

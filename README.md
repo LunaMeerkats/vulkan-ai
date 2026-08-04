@@ -71,6 +71,15 @@ loss trajectory and every parameter across CPU and Vulkan. This extends the
 compatibility evidence beyond a single affine layer without introducing random
 initialization or data ordering.
 
+A mini-batch checkpoint probe splits that nonlinear dataset into two fixed
+two-example batches and consumes batch identifiers in the repeating order
+`[0, 1, 1, 0]`. The reversed second epoch makes the next position after step 10
+different from a fresh run. At the checkpoint, the probe serializes the next
+schedule position as named MessagePack alongside the model and optimizer, then
+restores all three into fresh state. It compares the consumed batch sequence,
+full-dataset loss after every update, final data position, and all model
+parameters for uninterrupted and resumed CPU/Vulkan training.
+
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
 synchronization, and host readback is excluded. The report records the build
@@ -129,15 +138,18 @@ Vulkan checkpoint/resume loss: 0.92354155 -> 0.13259129 over 20 momentum SGD ste
 Vulkan checkpoint size: model 321 bytes, optimizer 351 bytes
 Vulkan nonlinear checkpoint/resume loss: 1.0672634 -> 0.9552125 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10 (momentum 0.9, dampening 0.1)
 Vulkan nonlinear checkpoint size: model 492 bytes, optimizer 536 bytes
+Vulkan mini-batch checkpoint/resume loss: 1.0672634 -> 0.9654751 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10
+Vulkan mini-batch schedule: [0, 1, 1, 0] repeating; restored data position 2
+Vulkan mini-batch checkpoint size: model 492 bytes, optimizer 536 bytes, data position 209 bytes
 Vulkan custom quadratic output: [2.0, -0.25, 0.0, 3.75]
 Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 ```
 
 ## Near-term roadmap
 
-- Add deterministic mini-batch ordering and checkpoint the data-position state
-  alongside the model and optimizer. The quadratic experiments do not justify
-  lower-level Vulkan interoperability.
+- Add a seeded epoch permutation and checkpoint its generator state before
+  introducing a larger data-loading abstraction. The quadratic experiments do
+  not justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

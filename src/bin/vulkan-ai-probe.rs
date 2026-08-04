@@ -14,11 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, CustomOpsBackend, NonlinearCheckpointProbeResult,
-    NonlinearOptimizerProbeResult, OPTIMIZER_CHECKPOINT_DAMPENING, OPTIMIZER_CHECKPOINT_MOMENTUM,
-    OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS,
-    OptimizerCheckpointProbeResult, OptimizerProbeResult, ProbeError, QuadraticTrainingPath,
-    TrainingProbeResult, quadratic, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+    CustomOpProbeResult, CustomOpsBackend, MiniBatchCheckpointProbeResult,
+    MiniBatchOptimizerProbeResult, NonlinearCheckpointProbeResult, NonlinearOptimizerProbeResult,
+    OPTIMIZER_CHECKPOINT_DAMPENING, OPTIMIZER_CHECKPOINT_MOMENTUM, OPTIMIZER_CHECKPOINT_STEP,
+    OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS, OptimizerCheckpointProbeResult,
+    OptimizerProbeResult, ProbeError, QuadraticTrainingPath, TrainingProbeResult, quadratic,
+    quadratic_reference, run_autodiff_probe, run_custom_op_probe, run_minibatch_checkpoint_probe,
     run_nonlinear_checkpoint_probe, run_optimizer_checkpoint_probe, run_optimizer_probe,
     run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
     run_training_probe,
@@ -528,6 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cpu_nonlinear_checkpoint_result,
         &vulkan_nonlinear_checkpoint_result,
     )?;
+    let vulkan_minibatch_checkpoint_result = run_minibatch_checkpoint_checks(&device)?;
     let cpu_custom_result = run_custom_op_probe::<CpuBackend>(&FlexDevice)?;
     let vulkan_custom_result = run_custom_op_probe::<VulkanAutodiffBackend>(&device)?;
     check_custom_op_parity(&cpu_custom_result, &vulkan_custom_result)?;
@@ -557,6 +559,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     print_optimizer_results(&vulkan_optimizer_result, &vulkan_checkpoint_result);
     print_nonlinear_checkpoint_results(&vulkan_nonlinear_checkpoint_result);
+    print_minibatch_checkpoint_results(&vulkan_minibatch_checkpoint_result);
     println!(
         "Vulkan custom quadratic output: {:?}",
         vulkan_custom_result.output
@@ -573,6 +576,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{custom_training_timing_report}");
 
     Ok(())
+}
+
+fn run_minibatch_checkpoint_checks(
+    device: &WgpuDevice,
+) -> Result<MiniBatchCheckpointProbeResult, Box<dyn std::error::Error>> {
+    type CpuBackend = Autodiff<Flex>;
+    type VulkanAutodiffBackend = Autodiff<VulkanBackend>;
+
+    let cpu = run_minibatch_checkpoint_probe::<CpuBackend>(&FlexDevice)?;
+    let vulkan = run_minibatch_checkpoint_probe::<VulkanAutodiffBackend>(device)?;
+    check_minibatch_checkpoint_parity(&cpu, &vulkan)?;
+    Ok(vulkan)
 }
 
 fn print_optimizer_results(
@@ -619,6 +634,27 @@ fn print_nonlinear_checkpoint_results(checkpoint: &NonlinearCheckpointProbeResul
     );
     println!(
         "CPU/Vulkan nonlinear uninterrupted and checkpoint-resumed parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+    );
+}
+
+fn print_minibatch_checkpoint_results(checkpoint: &MiniBatchCheckpointProbeResult) {
+    println!(
+        "Vulkan mini-batch checkpoint/resume loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} momentum SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}; checkpoint restored after step {OPTIMIZER_CHECKPOINT_STEP}",
+        checkpoint.resumed.losses[0], checkpoint.resumed.losses[OPTIMIZER_PROBE_STEPS]
+    );
+    println!(
+        "Vulkan mini-batch schedule: {:?} repeating; restored data position {}",
+        &checkpoint.resumed.batch_sequence[..4],
+        checkpoint.checkpoint_data_position
+    );
+    println!(
+        "Vulkan mini-batch checkpoint size: model {} bytes, optimizer {} bytes, data position {} bytes",
+        checkpoint.model_checkpoint_bytes,
+        checkpoint.optimizer_checkpoint_bytes,
+        checkpoint.data_checkpoint_bytes
+    );
+    println!(
+        "CPU/Vulkan mini-batch uninterrupted and checkpoint-resumed parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
 }
 
@@ -1077,6 +1113,41 @@ fn check_nonlinear_checkpoint_parity(
     )
 }
 
+fn check_minibatch_checkpoint_parity(
+    cpu: &MiniBatchCheckpointProbeResult,
+    vulkan: &MiniBatchCheckpointProbeResult,
+) -> Result<(), String> {
+    check_minibatch_loss_reduction("CPU uninterrupted", &cpu.uninterrupted)?;
+    check_minibatch_loss_reduction("CPU resumed", &cpu.resumed)?;
+    check_minibatch_loss_reduction("Vulkan uninterrupted", &vulkan.uninterrupted)?;
+    check_minibatch_loss_reduction("Vulkan resumed", &vulkan.resumed)?;
+    check_minibatch_optimizer_results(
+        "CPU uninterrupted",
+        &cpu.uninterrupted,
+        "CPU resumed",
+        &cpu.resumed,
+    )?;
+    check_minibatch_optimizer_results(
+        "Vulkan uninterrupted",
+        &vulkan.uninterrupted,
+        "Vulkan resumed",
+        &vulkan.resumed,
+    )?;
+    check_minibatch_optimizer_results(
+        "CPU resumed",
+        &cpu.resumed,
+        "Vulkan resumed",
+        &vulkan.resumed,
+    )?;
+    check_index_values(
+        "mini-batch checkpoint data position",
+        "CPU",
+        &[cpu.checkpoint_data_position],
+        "Vulkan",
+        &[vulkan.checkpoint_data_position],
+    )
+}
+
 fn check_optimizer_results(
     left_name: &str,
     left: &OptimizerProbeResult,
@@ -1129,6 +1200,66 @@ fn check_nonlinear_optimizer_results(
     )
 }
 
+fn check_minibatch_optimizer_results(
+    left_name: &str,
+    left: &MiniBatchOptimizerProbeResult,
+    right_name: &str,
+    right: &MiniBatchOptimizerProbeResult,
+) -> Result<(), String> {
+    check_index_values(
+        "mini-batch sequence",
+        left_name,
+        &left.batch_sequence,
+        right_name,
+        &right.batch_sequence,
+    )?;
+    check_index_values(
+        "mini-batch final data position",
+        left_name,
+        &[left.final_data_position],
+        right_name,
+        &[right.final_data_position],
+    )?;
+    check_named_values(
+        "mini-batch evaluation loss trajectory",
+        left_name,
+        &left.losses,
+        right_name,
+        &right.losses,
+    )?;
+    check_named_values(
+        "mini-batch final parameters",
+        left_name,
+        &left.final_parameters,
+        right_name,
+        &right.final_parameters,
+    )
+}
+
+fn check_index_values(
+    description: &str,
+    left_name: &str,
+    left: &[usize],
+    right_name: &str,
+    right: &[usize],
+) -> Result<(), String> {
+    if left.len() != right.len() {
+        return Err(format!(
+            "{left_name}/{right_name} {description} length differs: {} versus {}",
+            left.len(),
+            right.len()
+        ));
+    }
+    for (index, (&left_value, &right_value)) in left.iter().zip(right).enumerate() {
+        if left_value != right_value {
+            return Err(format!(
+                "{left_name}/{right_name} {description} differs at index {index}: {left_value} versus {right_value}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_loss_reduction(backend: &str, result: &OptimizerProbeResult) -> Result<(), String> {
     check_loss_trajectory_reduction(backend, &result.losses)
 }
@@ -1136,6 +1267,13 @@ fn check_loss_reduction(backend: &str, result: &OptimizerProbeResult) -> Result<
 fn check_nonlinear_loss_reduction(
     backend: &str,
     result: &NonlinearOptimizerProbeResult,
+) -> Result<(), String> {
+    check_loss_trajectory_reduction(backend, &result.losses)
+}
+
+fn check_minibatch_loss_reduction(
+    backend: &str,
+    result: &MiniBatchOptimizerProbeResult,
 ) -> Result<(), String> {
     check_loss_trajectory_reduction(backend, &result.losses)
 }
@@ -1221,11 +1359,12 @@ mod tests {
         CustomTimingMeasurement, CustomTrainingTimingMeasurement, TIMING_SCOPE,
         TIMING_SYNCHRONIZATION, TimingSummary, TrainingProbeResult, VulkanAdapterReport,
         VulkanCustomTimingReport, VulkanCustomTrainingTimingReport,
-        check_nonlinear_checkpoint_parity, check_optimizer_checkpoint_parity,
-        check_optimizer_parity, check_training_parity, custom_benchmark_order,
-        quadratic_training_order, timing_report,
+        check_minibatch_checkpoint_parity, check_nonlinear_checkpoint_parity,
+        check_optimizer_checkpoint_parity, check_optimizer_parity, check_training_parity,
+        custom_benchmark_order, quadratic_training_order, timing_report,
     };
     use vulkan_ai::{
+        MiniBatchCheckpointProbeResult, MiniBatchOptimizerProbeResult,
         NonlinearCheckpointProbeResult, NonlinearOptimizerProbeResult,
         OptimizerCheckpointProbeResult, OptimizerProbeResult, QuadraticTrainingPath,
     };
@@ -1366,6 +1505,28 @@ Vulkan compute capabilities:
         assert!(error.starts_with(
             "Vulkan uninterrupted/Vulkan resumed nonlinear optimizer final parameters differs at index 0"
         ));
+    }
+
+    #[test]
+    fn accepts_minibatch_order_and_checkpoint_parity() {
+        let cpu = minibatch_checkpoint_result(0.95);
+        let vulkan = minibatch_checkpoint_result(0.950_001);
+
+        check_minibatch_checkpoint_parity(&cpu, &vulkan).unwrap();
+    }
+
+    #[test]
+    fn rejects_minibatch_data_order_divergence() {
+        let cpu = minibatch_checkpoint_result(0.95);
+        let mut vulkan = minibatch_checkpoint_result(0.95);
+        vulkan.resumed.batch_sequence[1] = 0;
+
+        let error = check_minibatch_checkpoint_parity(&cpu, &vulkan).unwrap_err();
+
+        assert_eq!(
+            error,
+            "Vulkan uninterrupted/Vulkan resumed mini-batch sequence differs at index 1: 1 versus 0"
+        );
     }
 
     #[test]
@@ -1608,6 +1769,28 @@ Vulkan compute capabilities:
             final_parameters: vec![
                 0.2, -0.3, 0.4, -0.1, 0.5, 0.3, 0.1, -0.2, 0.05, 0.3, -0.4, 0.2, 0.0,
             ],
+        }
+    }
+
+    fn minibatch_checkpoint_result(final_loss: f32) -> MiniBatchCheckpointProbeResult {
+        MiniBatchCheckpointProbeResult {
+            uninterrupted: minibatch_optimizer_result(0.95),
+            resumed: minibatch_optimizer_result(final_loss),
+            model_checkpoint_bytes: 300,
+            optimizer_checkpoint_bytes: 400,
+            data_checkpoint_bytes: 100,
+            checkpoint_data_position: 2,
+        }
+    }
+
+    fn minibatch_optimizer_result(final_loss: f32) -> MiniBatchOptimizerProbeResult {
+        MiniBatchOptimizerProbeResult {
+            losses: vec![1.0, final_loss],
+            batch_sequence: vec![0, 1],
+            final_parameters: vec![
+                0.2, -0.3, 0.4, -0.1, 0.5, 0.3, 0.1, -0.2, 0.05, 0.3, -0.4, 0.2, 0.0,
+            ],
+            final_data_position: 2,
         }
     }
 }

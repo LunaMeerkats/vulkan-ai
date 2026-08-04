@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parity checks.
 - Deterministic two-layer tanh training for a nonlinear product target, with
   full-parameter CPU/Vulkan and serialized checkpoint/resume parity.
+- Deterministic two-batch nonlinear training with checkpointed data-position
+  state, consumed-order checks, full-dataset loss trajectories, and
+  uninterrupted/resumed CPU/Vulkan parity.
 
 ### Fixed
 

@@ -11,5 +11,5 @@ Describe what changed and why.
 - [ ] `cargo test --features vulkan-fusion --bin vulkan-ai-probe`
 - [ ] Vulkan-specific behavior was tested or clearly marked as compile-only
 - [ ] Custom kernels retain a reference path, parity coverage, and a synchronized benchmark
-- [ ] Optimizer/model changes preserve uninterrupted, checkpoint-resumed, and CPU/Vulkan parity
+- [ ] Optimizer/model/data-order changes preserve uninterrupted, checkpoint-resumed, and CPU/Vulkan parity
 - [ ] `CHANGELOG.md` was updated when the change is user-visible
