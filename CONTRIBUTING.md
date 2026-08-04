@@ -76,6 +76,13 @@ momentum. Model changes must exercise both the fixed linear probe and the
 `2 -> 3 -> 1` tanh probe for the nonlinear product target, including every
 parameter in uninterrupted/resumed and CPU/Vulkan comparisons.
 
+Mini-batch changes must also preserve the deterministic batch sequence and
+full-dataset evaluation trajectory. Checkpoint the next schedule position with
+the model and optimizer, restore all three into fresh state, and verify both
+the resumed batch sequence and final data position. The current two-batch
+schedule repeats `[0, 1, 1, 0]`, so the step-10 checkpoint cannot pass by
+silently restarting the schedule at position zero.
+
 ## Compatibility and releases
 
 - `main` must remain releasable.
