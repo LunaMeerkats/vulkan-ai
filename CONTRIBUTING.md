@@ -77,11 +77,13 @@ momentum. Model changes must exercise both the fixed linear probe and the
 parameter in uninterrupted/resumed and CPU/Vulkan comparisons.
 
 Mini-batch changes must also preserve the deterministic batch sequence and
-full-dataset evaluation trajectory. Checkpoint the next schedule position with
-the model and optimizer, restore all three into fresh state, and verify both
-the resumed batch sequence and final data position. The current two-batch
-schedule repeats `[0, 1, 1, 0]`, so the step-10 checkpoint cannot pass by
-silently restarting the schedule at position zero.
+full-dataset evaluation trajectory. The current two-batch protocol uses
+SplitMix64 with seed `0x5eedcafed15ca11e` to generate each epoch permutation.
+Checkpoint the generator state, current permutation, and next epoch position
+with the model and optimizer; restore all three records into fresh state; and
+verify the resumed batch sequence, final sampler state, and CPU/Vulkan parity.
+The expected post-checkpoint order differs from a fresh seeded run, so the
+probe must reject silent generator resets.
 
 ## Compatibility and releases
 

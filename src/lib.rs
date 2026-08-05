@@ -98,8 +98,10 @@ pub struct MiniBatchOptimizerProbeResult {
     pub batch_sequence: Vec<usize>,
     /// Final hidden weights, hidden bias, output weights, and output bias in that order.
     pub final_parameters: Vec<f32>,
-    /// Position of the next mini-batch in the deterministic schedule.
+    /// Position of the next mini-batch in the current epoch permutation.
     pub final_data_position: usize,
+    /// Deterministic generator state after the final epoch permutation was created.
+    pub final_generator_state: u64,
 }
 
 /// Values produced by uninterrupted and checkpoint-resumed mini-batch training.
@@ -107,16 +109,18 @@ pub struct MiniBatchOptimizerProbeResult {
 pub struct MiniBatchCheckpointProbeResult {
     /// Result from training straight through without interruption.
     pub uninterrupted: MiniBatchOptimizerProbeResult,
-    /// Result from restoring model, optimizer, and data-position state mid-run.
+    /// Result from restoring model, optimizer, and sampler state mid-run.
     pub resumed: MiniBatchOptimizerProbeResult,
     /// Size of the full-precision named `MessagePack` model checkpoint.
     pub model_checkpoint_bytes: usize,
     /// Size of the full-precision named `MessagePack` optimizer checkpoint.
     pub optimizer_checkpoint_bytes: usize,
-    /// Size of the named `MessagePack` data-position checkpoint.
+    /// Size of the named `MessagePack` sampler-state checkpoint.
     pub data_checkpoint_bytes: usize,
-    /// Schedule position restored after the checkpoint.
+    /// Epoch position restored after the checkpoint.
     pub checkpoint_data_position: usize,
+    /// Seeded permutation generator state restored after the checkpoint.
+    pub checkpoint_generator_state: u64,
 }
 
 #[derive(Module, Debug)]
@@ -154,9 +158,42 @@ struct CheckpointProbeExecution<R> {
     optimizer_checkpoint_bytes: usize,
 }
 
-#[derive(Record, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Record, Clone, Debug, PartialEq, Eq)]
 struct MiniBatchDataState {
+    generator_state: u64,
+    current_permutation: Vec<usize>,
     next_position: usize,
+}
+
+impl Default for MiniBatchDataState {
+    fn default() -> Self {
+        Self {
+            generator_state: MINI_BATCH_EPOCH_SEED,
+            current_permutation: (0..MINI_BATCH_COUNT).collect(),
+            next_position: MINI_BATCH_COUNT,
+        }
+    }
+}
+
+impl MiniBatchDataState {
+    fn next_batch(&mut self) -> Result<usize, ProbeError> {
+        if self.next_position > MINI_BATCH_COUNT {
+            return Err(ProbeError::InvalidMiniBatchPosition(self.next_position));
+        }
+        if !is_valid_mini_batch_permutation(&self.current_permutation) {
+            return Err(ProbeError::InvalidMiniBatchPermutation(
+                self.current_permutation.clone(),
+            ));
+        }
+        if self.next_position == MINI_BATCH_COUNT {
+            self.current_permutation = seeded_epoch_permutation(&mut self.generator_state);
+            self.next_position = 0;
+        }
+
+        let batch_index = self.current_permutation[self.next_position];
+        self.next_position += 1;
+        Ok(batch_index)
+    }
 }
 
 /// Number of full-batch SGD updates used by [`run_optimizer_probe`].
@@ -169,7 +206,9 @@ pub const OPTIMIZER_CHECKPOINT_STEP: usize = OPTIMIZER_PROBE_STEPS / 2;
 pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
 /// Dampening factor used by the stateful checkpoint/resume probe.
 pub const OPTIMIZER_CHECKPOINT_DAMPENING: f64 = 0.1;
-const MINI_BATCH_ORDER: [usize; 4] = [0, 1, 1, 0];
+/// Fixed seed used to generate deterministic mini-batch permutations for each epoch.
+pub const MINI_BATCH_EPOCH_SEED: u64 = 0x5EED_CAFE_D15C_A11E;
+const MINI_BATCH_COUNT: usize = 2;
 
 /// Values produced by the custom quadratic operation and its backward rule.
 #[derive(Debug, PartialEq)]
@@ -206,8 +245,10 @@ pub enum ProbeError {
     DataConversion(String),
     /// Model or optimizer state could not be serialized or restored.
     CheckpointSerialization(String),
-    /// Restored mini-batch state did not identify a valid schedule position.
+    /// Restored mini-batch state did not identify a valid epoch position.
     InvalidMiniBatchPosition(usize),
+    /// Restored mini-batch state did not contain each batch identifier exactly once.
+    InvalidMiniBatchPermutation(Vec<usize>),
     /// The backend could not synchronize a measured workload.
     Synchronization(String),
     /// `CubeCL` could not profile a measured workload consistently.
@@ -245,7 +286,13 @@ impl fmt::Display for ProbeError {
             Self::InvalidMiniBatchPosition(position) => {
                 write!(
                     formatter,
-                    "mini-batch data position {position} is outside the deterministic schedule"
+                    "mini-batch data position {position} is outside the current epoch permutation"
+                )
+            }
+            Self::InvalidMiniBatchPermutation(permutation) => {
+                write!(
+                    formatter,
+                    "mini-batch epoch permutation {permutation:?} does not contain every batch exactly once"
                 )
             }
             Self::Synchronization(message) => {
@@ -492,19 +539,18 @@ where
 
 /// Compare uninterrupted mini-batch training with a complete checkpoint/resume run.
 ///
-/// The nonlinear dataset is split into two fixed two-example batches. Their
-/// deterministic four-step schedule alternates epoch order, so the checkpoint
-/// after step 10 resumes from a different position than a fresh run. The
-/// resumed path records and restores the data position alongside the model and
-/// optimizer, then compares the full-dataset loss trajectory, consumed batch
-/// sequence, final parameters, and final data position with uninterrupted
-/// training.
+/// The nonlinear dataset is split into two fixed two-example batches. A fixed
+/// seed drives a new permutation for every two-step epoch. The checkpoint after
+/// step 10 records the generator state, current permutation, and next position
+/// alongside the model and optimizer. The resumed path compares the full-dataset
+/// loss trajectory, consumed batch sequence, final parameters, sampler state,
+/// and generator state with uninterrupted training.
 ///
 /// # Errors
 ///
 /// Returns [`ProbeError`] if tensor data cannot be read, a layer is missing its
-/// bias, checkpoint state cannot be serialized or restored, or a restored data
-/// position is outside the deterministic schedule.
+/// bias, checkpoint state cannot be serialized or restored, or restored sampler
+/// state is invalid.
 pub fn run_minibatch_checkpoint_probe<B>(
     device: &B::Device,
 ) -> Result<MiniBatchCheckpointProbeResult, ProbeError>
@@ -533,6 +579,7 @@ where
         uninterrupted_losses,
         uninterrupted_batches,
         uninterrupted_state.next_position,
+        uninterrupted_state.generator_state,
     )?;
 
     let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
@@ -563,6 +610,7 @@ where
     let optimizer_checkpoint_bytes = optimizer_checkpoint.len();
     let data_checkpoint_bytes = data_checkpoint.len();
     let checkpoint_data_position = resumed_state.next_position;
+    let checkpoint_generator_state = resumed_state.generator_state;
 
     let restored_model_record = Recorder::<B>::load(&recorder, model_checkpoint, device)
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
@@ -592,6 +640,7 @@ where
         resumed_losses,
         resumed_batches,
         restored_state.next_position,
+        restored_state.generator_state,
     )?;
 
     Ok(MiniBatchCheckpointProbeResult {
@@ -601,6 +650,7 @@ where
         optimizer_checkpoint_bytes,
         data_checkpoint_bytes,
         checkpoint_data_position,
+        checkpoint_generator_state,
     })
 }
 
@@ -746,18 +796,13 @@ where
     }
 
     for _ in 0..steps {
-        let Some(&batch_index) = MINI_BATCH_ORDER.get(data_state.next_position) else {
-            return Err(ProbeError::InvalidMiniBatchPosition(
-                data_state.next_position,
-            ));
-        };
+        let batch_index = data_state.next_batch()?;
         let (input, target) = nonlinear_mini_batch::<B>(batch_index, device);
         let loss = MseLoss::new().forward(model.forward(input), target, Reduction::Mean);
         let gradients = loss.backward();
         let gradients = GradientsParams::from_grads(gradients, &model);
         model = optimizer.step(OPTIMIZER_PROBE_LEARNING_RATE, model, gradients);
         batch_sequence.push(batch_index);
-        data_state.next_position = (data_state.next_position + 1) % MINI_BATCH_ORDER.len();
 
         losses.push(read_loss(MseLoss::new().forward(
             model.forward(evaluation_input.clone()),
@@ -828,6 +873,7 @@ fn minibatch_optimizer_probe_result<B>(
     losses: Vec<f32>,
     batch_sequence: Vec<usize>,
     final_data_position: usize,
+    final_generator_state: u64,
 ) -> Result<MiniBatchOptimizerProbeResult, ProbeError>
 where
     B: AutodiffBackend<FloatElem = f32>,
@@ -837,7 +883,29 @@ where
         batch_sequence,
         final_parameters: nonlinear_parameters(model)?,
         final_data_position,
+        final_generator_state,
     })
+}
+
+fn seeded_epoch_permutation(generator_state: &mut u64) -> Vec<usize> {
+    let mut permutation: Vec<_> = (0..MINI_BATCH_COUNT).collect();
+    if splitmix64(generator_state) & 1 == 1 {
+        permutation.swap(0, 1);
+    }
+    permutation
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn is_valid_mini_batch_permutation(permutation: &[usize]) -> bool {
+    permutation.len() == MINI_BATCH_COUNT
+        && (0..MINI_BATCH_COUNT).all(|batch| permutation.contains(&batch))
 }
 
 fn nonlinear_parameters<B>(model: &NonlinearModel<B>) -> Result<Vec<f32>, ProbeError>
@@ -1040,9 +1108,10 @@ mod tests {
     };
 
     use super::{
-        CustomOpProbeResult, OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_STEPS, ProbeResult,
-        QuadraticTrainingPath, TrainingProbeResult, quadratic_reference, run_autodiff_probe,
-        run_custom_op_probe, run_minibatch_checkpoint_probe, run_nonlinear_checkpoint_probe,
+        CustomOpProbeResult, MINI_BATCH_EPOCH_SEED, MiniBatchDataState, OPTIMIZER_CHECKPOINT_STEP,
+        OPTIMIZER_PROBE_STEPS, ProbeResult, QuadraticTrainingPath, TrainingProbeResult,
+        quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+        run_minibatch_checkpoint_probe, run_nonlinear_checkpoint_probe,
         run_optimizer_checkpoint_probe, run_optimizer_probe,
         run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
         run_training_probe,
@@ -1154,15 +1223,19 @@ mod tests {
         type Backend = Autodiff<Flex>;
 
         let result = run_minibatch_checkpoint_probe::<Backend>(&FlexDevice).unwrap();
-
         assert_eq!(result.uninterrupted, result.resumed);
         assert_eq!(result.uninterrupted.losses.len(), OPTIMIZER_PROBE_STEPS + 1);
         assert_eq!(
             result.uninterrupted.batch_sequence,
-            [0, 1, 1, 0].repeat(OPTIMIZER_PROBE_STEPS / 4)
+            [0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1]
         );
         assert_eq!(result.checkpoint_data_position, 2);
-        assert_eq!(result.uninterrupted.final_data_position, 0);
+        assert_eq!(result.uninterrupted.final_data_position, 2);
+        assert_eq!(result.checkpoint_generator_state, 0x7603_2B9E_4DD1_0D87);
+        assert_eq!(
+            result.uninterrupted.final_generator_state,
+            0x8D18_8C3D_CA45_79F0
+        );
         assert!(result.model_checkpoint_bytes > 0);
         assert!(result.optimizer_checkpoint_bytes > 0);
         assert!(result.data_checkpoint_bytes > 0);
@@ -1172,26 +1245,47 @@ mod tests {
         assert_values_close(&[result.uninterrupted.losses[0]], &[1.067_263_4]);
         assert_values_close(
             &[result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS]],
-            &[0.965_475_1],
+            &[1.036_678],
         );
         assert_values_close(
             &result.uninterrupted.final_parameters,
             &[
-                0.241_854_15,
-                -0.346_264_4,
-                -0.014_119_865,
-                -0.162_094_79,
-                0.513_146_7,
-                0.440_132_35,
-                0.150_679_38,
-                -0.447_930_66,
-                -0.074_730_776,
-                -0.112_349_58,
-                -0.230_669_89,
-                0.111_102_74,
-                -0.017_807_098,
+                0.245_957_75,
+                -0.341_024_52,
+                -0.011_708_6,
+                -0.162_310_63,
+                0.505_213,
+                0.445_480_6,
+                0.113_312_036,
+                -0.443_499_77,
+                -0.046_578_33,
+                -0.091_466_64,
+                -0.273_467_15,
+                0.097_917_41,
+                0.201_636_57,
             ],
         );
+    }
+
+    #[test]
+    fn seeded_epoch_permutations_are_reproducible_and_checkpoint_sensitive() {
+        let mut state = MiniBatchDataState::default();
+        let first_half: Vec<_> = (0..OPTIMIZER_CHECKPOINT_STEP)
+            .map(|_| state.next_batch().unwrap())
+            .collect();
+        let mut resumed_state = state.clone();
+        let second_half: Vec<_> = (OPTIMIZER_CHECKPOINT_STEP..OPTIMIZER_PROBE_STEPS)
+            .map(|_| resumed_state.next_batch().unwrap())
+            .collect();
+        let mut restarted_state = MiniBatchDataState::default();
+        let restarted_second_half: Vec<_> = (OPTIMIZER_CHECKPOINT_STEP..OPTIMIZER_PROBE_STEPS)
+            .map(|_| restarted_state.next_batch().unwrap())
+            .collect();
+
+        assert_eq!(MINI_BATCH_EPOCH_SEED, 0x5EED_CAFE_D15C_A11E);
+        assert_eq!(first_half, [0, 1, 1, 0, 0, 1, 1, 0, 1, 0]);
+        assert_eq!(second_half, [1, 0, 0, 1, 1, 0, 0, 1, 0, 1]);
+        assert_ne!(second_half, restarted_second_half);
     }
 
     #[test]
