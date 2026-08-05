@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, CustomOpsBackend, MiniBatchCheckpointProbeResult,
+    CustomOpProbeResult, CustomOpsBackend, MINI_BATCH_EPOCH_SEED, MiniBatchCheckpointProbeResult,
     MiniBatchOptimizerProbeResult, NonlinearCheckpointProbeResult, NonlinearOptimizerProbeResult,
     OPTIMIZER_CHECKPOINT_DAMPENING, OPTIMIZER_CHECKPOINT_MOMENTUM, OPTIMIZER_CHECKPOINT_STEP,
     OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS, OptimizerCheckpointProbeResult,
@@ -643,12 +643,13 @@ fn print_minibatch_checkpoint_results(checkpoint: &MiniBatchCheckpointProbeResul
         checkpoint.resumed.losses[0], checkpoint.resumed.losses[OPTIMIZER_PROBE_STEPS]
     );
     println!(
-        "Vulkan mini-batch schedule: {:?} repeating; restored data position {}",
-        &checkpoint.resumed.batch_sequence[..4],
-        checkpoint.checkpoint_data_position
+        "Vulkan mini-batch epoch permutations: seed {MINI_BATCH_EPOCH_SEED:#018x}; first five epochs {:?}; restored epoch position {}; restored generator state {:#018x}",
+        &checkpoint.resumed.batch_sequence[..10],
+        checkpoint.checkpoint_data_position,
+        checkpoint.checkpoint_generator_state
     );
     println!(
-        "Vulkan mini-batch checkpoint size: model {} bytes, optimizer {} bytes, data position {} bytes",
+        "Vulkan mini-batch checkpoint size: model {} bytes, optimizer {} bytes, sampler state {} bytes",
         checkpoint.model_checkpoint_bytes,
         checkpoint.optimizer_checkpoint_bytes,
         checkpoint.data_checkpoint_bytes
@@ -1145,6 +1146,13 @@ fn check_minibatch_checkpoint_parity(
         &[cpu.checkpoint_data_position],
         "Vulkan",
         &[vulkan.checkpoint_data_position],
+    )?;
+    check_u64_values(
+        "mini-batch checkpoint generator state",
+        "CPU",
+        &[cpu.checkpoint_generator_state],
+        "Vulkan",
+        &[vulkan.checkpoint_generator_state],
     )
 }
 
@@ -1220,6 +1228,13 @@ fn check_minibatch_optimizer_results(
         right_name,
         &[right.final_data_position],
     )?;
+    check_u64_values(
+        "mini-batch final generator state",
+        left_name,
+        &[left.final_generator_state],
+        right_name,
+        &[right.final_generator_state],
+    )?;
     check_named_values(
         "mini-batch evaluation loss trajectory",
         left_name,
@@ -1254,6 +1269,30 @@ fn check_index_values(
         if left_value != right_value {
             return Err(format!(
                 "{left_name}/{right_name} {description} differs at index {index}: {left_value} versus {right_value}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_u64_values(
+    description: &str,
+    left_name: &str,
+    left: &[u64],
+    right_name: &str,
+    right: &[u64],
+) -> Result<(), String> {
+    if left.len() != right.len() {
+        return Err(format!(
+            "{left_name}/{right_name} {description} length differs: {} versus {}",
+            left.len(),
+            right.len()
+        ));
+    }
+    for (index, (&left_value, &right_value)) in left.iter().zip(right).enumerate() {
+        if left_value != right_value {
+            return Err(format!(
+                "{left_name}/{right_name} {description} differs at index {index}: {left_value:#018x} versus {right_value:#018x}"
             ));
         }
     }
@@ -1530,6 +1569,20 @@ Vulkan compute capabilities:
     }
 
     #[test]
+    fn rejects_minibatch_generator_state_divergence() {
+        let cpu = minibatch_checkpoint_result(0.95);
+        let mut vulkan = minibatch_checkpoint_result(0.95);
+        vulkan.resumed.final_generator_state = 0x9999;
+
+        let error = check_minibatch_checkpoint_parity(&cpu, &vulkan).unwrap_err();
+
+        assert_eq!(
+            error,
+            "Vulkan uninterrupted/Vulkan resumed mini-batch final generator state differs at index 0: 0x0000000000005678 versus 0x0000000000009999"
+        );
+    }
+
+    #[test]
     fn summarizes_and_serializes_timing_samples() {
         let report = timing_report(
             &[
@@ -1780,6 +1833,7 @@ Vulkan compute capabilities:
             optimizer_checkpoint_bytes: 400,
             data_checkpoint_bytes: 100,
             checkpoint_data_position: 2,
+            checkpoint_generator_state: 0x1234,
         }
     }
 
@@ -1791,6 +1845,7 @@ Vulkan compute capabilities:
                 0.2, -0.3, 0.4, -0.1, 0.5, 0.3, 0.1, -0.2, 0.05, 0.3, -0.4, 0.2, 0.0,
             ],
             final_data_position: 2,
+            final_generator_state: 0x5678,
         }
     }
 }

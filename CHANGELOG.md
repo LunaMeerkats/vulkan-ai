@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deterministic two-batch nonlinear training with checkpointed data-position
   state, consumed-order checks, full-dataset loss trajectories, and
   uninterrupted/resumed CPU/Vulkan parity.
+- Fixed-seed epoch permutations with checkpointed generator, current-order,
+  and epoch-position state plus explicit generator-reset detection.
 
 ### Fixed
 
