@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uninterrupted/resumed CPU/Vulkan parity.
 - Fixed-seed epoch permutations with checkpointed generator, current-order,
   and epoch-position state plus explicit generator-reset detection.
+- Inside-epoch mini-batch checkpoint/resume coverage that proves the current
+  permutation and cursor both survive serialization.
 
 ### Fixed
 

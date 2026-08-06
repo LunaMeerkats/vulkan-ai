@@ -119,6 +119,8 @@ pub struct MiniBatchCheckpointProbeResult {
     pub data_checkpoint_bytes: usize,
     /// Epoch position restored after the checkpoint.
     pub checkpoint_data_position: usize,
+    /// Current epoch permutation restored after the checkpoint.
+    pub checkpoint_epoch_permutation: Vec<usize>,
     /// Seeded permutation generator state restored after the checkpoint.
     pub checkpoint_generator_state: u64,
 }
@@ -202,6 +204,11 @@ pub const OPTIMIZER_PROBE_STEPS: usize = 20;
 pub const OPTIMIZER_PROBE_LEARNING_RATE: f64 = 0.05;
 /// Update after which [`run_optimizer_checkpoint_probe`] saves and restores state.
 pub const OPTIMIZER_CHECKPOINT_STEP: usize = OPTIMIZER_PROBE_STEPS / 2;
+/// Update after which [`run_minibatch_checkpoint_probe`] saves sampler state.
+///
+/// The odd step deliberately places the checkpoint inside a two-batch epoch so
+/// restoring only the generator or epoch position cannot reproduce the run.
+pub const MINI_BATCH_CHECKPOINT_STEP: usize = OPTIMIZER_CHECKPOINT_STEP + 1;
 /// Momentum factor used by the stateful checkpoint/resume probe.
 pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
 /// Dampening factor used by the stateful checkpoint/resume probe.
@@ -541,10 +548,10 @@ where
 ///
 /// The nonlinear dataset is split into two fixed two-example batches. A fixed
 /// seed drives a new permutation for every two-step epoch. The checkpoint after
-/// step 10 records the generator state, current permutation, and next position
-/// alongside the model and optimizer. The resumed path compares the full-dataset
-/// loss trajectory, consumed batch sequence, final parameters, sampler state,
-/// and generator state with uninterrupted training.
+/// step 11 records the generator state, current permutation, and next position
+/// from inside an epoch alongside the model and optimizer. The resumed path
+/// compares the full-dataset loss trajectory, consumed batch sequence, final
+/// parameters, sampler state, and generator state with uninterrupted training.
 ///
 /// # Errors
 ///
@@ -593,7 +600,7 @@ where
         &evaluation_input,
         &evaluation_target,
         device,
-        OPTIMIZER_CHECKPOINT_STEP,
+        MINI_BATCH_CHECKPOINT_STEP,
         &mut resumed_losses,
         &mut resumed_batches,
     )?;
@@ -609,8 +616,6 @@ where
     let model_checkpoint_bytes = model_checkpoint.len();
     let optimizer_checkpoint_bytes = optimizer_checkpoint.len();
     let data_checkpoint_bytes = data_checkpoint.len();
-    let checkpoint_data_position = resumed_state.next_position;
-    let checkpoint_generator_state = resumed_state.generator_state;
 
     let restored_model_record = Recorder::<B>::load(&recorder, model_checkpoint, device)
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
@@ -623,6 +628,9 @@ where
     let mut restored_state: MiniBatchDataState =
         Recorder::<B>::load(&recorder, data_checkpoint, device)
             .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let checkpoint_data_position = restored_state.next_position;
+    let checkpoint_epoch_permutation = restored_state.current_permutation.clone();
+    let checkpoint_generator_state = restored_state.generator_state;
 
     let resumed_model = run_minibatch_optimizer_updates(
         restored_model,
@@ -631,7 +639,7 @@ where
         &evaluation_input,
         &evaluation_target,
         device,
-        OPTIMIZER_PROBE_STEPS - OPTIMIZER_CHECKPOINT_STEP,
+        OPTIMIZER_PROBE_STEPS - MINI_BATCH_CHECKPOINT_STEP,
         &mut resumed_losses,
         &mut resumed_batches,
     )?;
@@ -650,6 +658,7 @@ where
         optimizer_checkpoint_bytes,
         data_checkpoint_bytes,
         checkpoint_data_position,
+        checkpoint_epoch_permutation,
         checkpoint_generator_state,
     })
 }
@@ -1108,9 +1117,9 @@ mod tests {
     };
 
     use super::{
-        CustomOpProbeResult, MINI_BATCH_EPOCH_SEED, MiniBatchDataState, OPTIMIZER_CHECKPOINT_STEP,
-        OPTIMIZER_PROBE_STEPS, ProbeResult, QuadraticTrainingPath, TrainingProbeResult,
-        quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+        CustomOpProbeResult, MINI_BATCH_CHECKPOINT_STEP, MINI_BATCH_EPOCH_SEED, MiniBatchDataState,
+        OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_STEPS, ProbeResult, QuadraticTrainingPath,
+        TrainingProbeResult, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
         run_minibatch_checkpoint_probe, run_nonlinear_checkpoint_probe,
         run_optimizer_checkpoint_probe, run_optimizer_probe,
         run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
@@ -1229,9 +1238,11 @@ mod tests {
             result.uninterrupted.batch_sequence,
             [0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1]
         );
-        assert_eq!(result.checkpoint_data_position, 2);
+        assert_eq!(MINI_BATCH_CHECKPOINT_STEP, 11);
+        assert_eq!(result.checkpoint_data_position, 1);
+        assert_eq!(result.checkpoint_epoch_permutation, [1, 0]);
         assert_eq!(result.uninterrupted.final_data_position, 2);
-        assert_eq!(result.checkpoint_generator_state, 0x7603_2B9E_4DD1_0D87);
+        assert_eq!(result.checkpoint_generator_state, 0x143A_A557_CD1B_899C);
         assert_eq!(
             result.uninterrupted.final_generator_state,
             0x8D18_8C3D_CA45_79F0
@@ -1270,22 +1281,30 @@ mod tests {
     #[test]
     fn seeded_epoch_permutations_are_reproducible_and_checkpoint_sensitive() {
         let mut state = MiniBatchDataState::default();
-        let first_half: Vec<_> = (0..OPTIMIZER_CHECKPOINT_STEP)
+        let before_checkpoint: Vec<_> = (0..MINI_BATCH_CHECKPOINT_STEP)
             .map(|_| state.next_batch().unwrap())
             .collect();
         let mut resumed_state = state.clone();
-        let second_half: Vec<_> = (OPTIMIZER_CHECKPOINT_STEP..OPTIMIZER_PROBE_STEPS)
+        let after_checkpoint: Vec<_> = (MINI_BATCH_CHECKPOINT_STEP..OPTIMIZER_PROBE_STEPS)
             .map(|_| resumed_state.next_batch().unwrap())
             .collect();
-        let mut restarted_state = MiniBatchDataState::default();
-        let restarted_second_half: Vec<_> = (OPTIMIZER_CHECKPOINT_STEP..OPTIMIZER_PROBE_STEPS)
-            .map(|_| restarted_state.next_batch().unwrap())
+        let mut reset_generator_state = state.clone();
+        reset_generator_state.generator_state = MINI_BATCH_EPOCH_SEED;
+        let reset_generator_second_half: Vec<_> = (MINI_BATCH_CHECKPOINT_STEP
+            ..OPTIMIZER_PROBE_STEPS)
+            .map(|_| reset_generator_state.next_batch().unwrap())
             .collect();
+        let mut reset_permutation_state = state.clone();
+        reset_permutation_state.current_permutation = vec![0, 1];
+        let reset_permutation_next_batch = reset_permutation_state.next_batch().unwrap();
 
         assert_eq!(MINI_BATCH_EPOCH_SEED, 0x5EED_CAFE_D15C_A11E);
-        assert_eq!(first_half, [0, 1, 1, 0, 0, 1, 1, 0, 1, 0]);
-        assert_eq!(second_half, [1, 0, 0, 1, 1, 0, 0, 1, 0, 1]);
-        assert_ne!(second_half, restarted_second_half);
+        assert_eq!(before_checkpoint, [0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1]);
+        assert_eq!(state.next_position, 1);
+        assert_eq!(state.current_permutation, [1, 0]);
+        assert_eq!(after_checkpoint, [0, 0, 1, 1, 0, 0, 1, 0, 1]);
+        assert_ne!(after_checkpoint, reset_generator_second_half);
+        assert_ne!(after_checkpoint[0], reset_permutation_next_batch);
     }
 
     #[test]

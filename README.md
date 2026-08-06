@@ -74,13 +74,14 @@ initialization or data ordering.
 A mini-batch checkpoint probe splits that nonlinear dataset into two fixed
 two-example batches and uses SplitMix64 with the fixed seed
 `0x5eedcafed15ca11e` to create a new permutation for every epoch. At the
-checkpoint, the probe serializes the generator state, current permutation, and
-next epoch position as named MessagePack alongside the model and optimizer,
-then restores all three records into fresh state. It compares the consumed
-batch sequence, full-dataset loss after every update, final sampler state, and
-all model parameters for uninterrupted and resumed CPU/Vulkan training. The
-post-checkpoint permutations differ from a fresh seeded run, so silently
-restarting the generator is detectable.
+checkpoint after update 11, the probe serializes the generator state, current
+permutation, and next epoch position from inside a two-step epoch as named
+MessagePack alongside the model and optimizer, then restores all three records
+into fresh state. It compares the consumed batch sequence, full-dataset loss
+after every update, final sampler state, and all model parameters for
+uninterrupted and resumed CPU/Vulkan training. The next batch differs if either
+the current permutation or the generator is reset, so both failure modes are
+detectable.
 
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
@@ -140,8 +141,8 @@ Vulkan checkpoint/resume loss: 0.92354155 -> 0.13259129 over 20 momentum SGD ste
 Vulkan checkpoint size: model 321 bytes, optimizer 351 bytes
 Vulkan nonlinear checkpoint/resume loss: 1.0672634 -> 0.9552125 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10 (momentum 0.9, dampening 0.1)
 Vulkan nonlinear checkpoint size: model 492 bytes, optimizer 536 bytes
-Vulkan mini-batch checkpoint/resume loss: 1.0672634 -> 1.036678 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10
-Vulkan mini-batch epoch permutations: seed 0x5eedcafed15ca11e; first five epochs [0, 1, 1, 0, 0, 1, 1, 0, 1, 0]; restored epoch position 2; restored generator state 0x76032b9e4dd10d87
+Vulkan mini-batch checkpoint/resume loss: 1.0672634 -> 1.036678 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 11
+Vulkan mini-batch epoch permutations: seed 0x5eedcafed15ca11e; first five epochs [0, 1, 1, 0, 0, 1, 1, 0, 1, 0]; restored epoch permutation [1, 0]; restored epoch position 1; restored generator state 0x143aa557cd1b899c
 Vulkan mini-batch checkpoint size: model 492 bytes, optimizer 536 bytes, sampler state 257 bytes
 Vulkan custom quadratic output: [2.0, -0.25, 0.0, 3.75]
 Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
@@ -149,9 +150,9 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Exercise sampler checkpoint/resume from inside an epoch before extracting a
-  larger data-loading abstraction. The quadratic experiments do not justify
-  lower-level Vulkan interoperability.
+- Extract the proven sampler state machine behind a small data-loading
+  boundary without weakening its seeded-order or checkpoint guarantees. The
+  quadratic experiments do not justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.
