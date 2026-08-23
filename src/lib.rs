@@ -2,7 +2,10 @@
 
 //! Small, backend-independent checks for Vulkan AI research workflows.
 
+mod data;
 mod ops;
+
+use data::{SamplerError, SeededBatchSampler};
 
 use burn::{
     module::{AutodiffModule, Module, Param},
@@ -11,7 +14,7 @@ use burn::{
         loss::{MseLoss, Reduction},
     },
     optim::{GradientsParams, Optimizer, SgdConfig, momentum::MomentumConfig},
-    record::{FullPrecisionSettings, NamedMpkBytesRecorder, Record, Recorder},
+    record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder},
     tensor::{
         Tensor,
         backend::{AutodiffBackend, Backend},
@@ -160,44 +163,6 @@ struct CheckpointProbeExecution<R> {
     optimizer_checkpoint_bytes: usize,
 }
 
-#[derive(Record, Clone, Debug, PartialEq, Eq)]
-struct MiniBatchDataState {
-    generator_state: u64,
-    current_permutation: Vec<usize>,
-    next_position: usize,
-}
-
-impl Default for MiniBatchDataState {
-    fn default() -> Self {
-        Self {
-            generator_state: MINI_BATCH_EPOCH_SEED,
-            current_permutation: (0..MINI_BATCH_COUNT).collect(),
-            next_position: MINI_BATCH_COUNT,
-        }
-    }
-}
-
-impl MiniBatchDataState {
-    fn next_batch(&mut self) -> Result<usize, ProbeError> {
-        if self.next_position > MINI_BATCH_COUNT {
-            return Err(ProbeError::InvalidMiniBatchPosition(self.next_position));
-        }
-        if !is_valid_mini_batch_permutation(&self.current_permutation) {
-            return Err(ProbeError::InvalidMiniBatchPermutation(
-                self.current_permutation.clone(),
-            ));
-        }
-        if self.next_position == MINI_BATCH_COUNT {
-            self.current_permutation = seeded_epoch_permutation(&mut self.generator_state);
-            self.next_position = 0;
-        }
-
-        let batch_index = self.current_permutation[self.next_position];
-        self.next_position += 1;
-        Ok(batch_index)
-    }
-}
-
 /// Number of full-batch SGD updates used by [`run_optimizer_probe`].
 pub const OPTIMIZER_PROBE_STEPS: usize = 20;
 /// Learning rate used by [`run_optimizer_probe`].
@@ -215,7 +180,6 @@ pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
 pub const OPTIMIZER_CHECKPOINT_DAMPENING: f64 = 0.1;
 /// Fixed seed used to generate deterministic mini-batch permutations for each epoch.
 pub const MINI_BATCH_EPOCH_SEED: u64 = 0x5EED_CAFE_D15C_A11E;
-const MINI_BATCH_COUNT: usize = 2;
 
 /// Values produced by the custom quadratic operation and its backward rule.
 #[derive(Debug, PartialEq)]
@@ -354,6 +318,17 @@ where
 }
 
 impl Error for ProbeError {}
+
+impl From<SamplerError> for ProbeError {
+    fn from(error: SamplerError) -> Self {
+        match error {
+            SamplerError::InvalidPosition(position) => Self::InvalidMiniBatchPosition(position),
+            SamplerError::InvalidPermutation(permutation) => {
+                Self::InvalidMiniBatchPermutation(permutation)
+            }
+        }
+    }
+}
 
 struct TrainingProbeTensors<B>
 where
@@ -567,13 +542,13 @@ where
     let (evaluation_input, evaluation_target) = nonlinear_training_batch::<B>(device);
 
     let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
-    let mut uninterrupted_state = MiniBatchDataState::default();
+    let mut uninterrupted_sampler = SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED);
     let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut uninterrupted_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let uninterrupted_model = run_minibatch_optimizer_updates(
         nonlinear_training_model::<B>(device),
         &mut uninterrupted_optimizer,
-        &mut uninterrupted_state,
+        &mut uninterrupted_sampler,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -585,18 +560,18 @@ where
         &uninterrupted_model,
         uninterrupted_losses,
         uninterrupted_batches,
-        uninterrupted_state.next_position,
-        uninterrupted_state.generator_state,
+        uninterrupted_sampler.next_position(),
+        uninterrupted_sampler.generator_state(),
     )?;
 
     let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
-    let mut resumed_state = MiniBatchDataState::default();
+    let mut resumed_sampler = SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED);
     let mut resumed_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut resumed_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let resumed_model = run_minibatch_optimizer_updates(
         nonlinear_training_model::<B>(device),
         &mut resumed_optimizer,
-        &mut resumed_state,
+        &mut resumed_sampler,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -611,7 +586,7 @@ where
             .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
     let optimizer_checkpoint = Recorder::<B>::record(&recorder, resumed_optimizer.to_record(), ())
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
-    let data_checkpoint = Recorder::<B>::record(&recorder, resumed_state.clone(), ())
+    let data_checkpoint = Recorder::<B>::record(&recorder, resumed_sampler.clone(), ())
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
     let model_checkpoint_bytes = model_checkpoint.len();
     let optimizer_checkpoint_bytes = optimizer_checkpoint.len();
@@ -625,17 +600,17 @@ where
     let mut restored_optimizer = checkpoint_optimizer_config()
         .init::<B, NonlinearModel<B>>()
         .load_record(restored_optimizer_record);
-    let mut restored_state: MiniBatchDataState =
+    let mut restored_sampler: SeededBatchSampler =
         Recorder::<B>::load(&recorder, data_checkpoint, device)
             .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
-    let checkpoint_data_position = restored_state.next_position;
-    let checkpoint_epoch_permutation = restored_state.current_permutation.clone();
-    let checkpoint_generator_state = restored_state.generator_state;
+    let checkpoint_data_position = restored_sampler.next_position();
+    let checkpoint_epoch_permutation = restored_sampler.current_permutation().to_vec();
+    let checkpoint_generator_state = restored_sampler.generator_state();
 
     let resumed_model = run_minibatch_optimizer_updates(
         restored_model,
         &mut restored_optimizer,
-        &mut restored_state,
+        &mut restored_sampler,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -647,8 +622,8 @@ where
         &resumed_model,
         resumed_losses,
         resumed_batches,
-        restored_state.next_position,
-        restored_state.generator_state,
+        restored_sampler.next_position(),
+        restored_sampler.generator_state(),
     )?;
 
     Ok(MiniBatchCheckpointProbeResult {
@@ -784,7 +759,7 @@ where
 fn run_minibatch_optimizer_updates<B, O>(
     mut model: NonlinearModel<B>,
     optimizer: &mut O,
-    data_state: &mut MiniBatchDataState,
+    sampler: &mut SeededBatchSampler,
     evaluation_input: &Tensor<B, 2>,
     evaluation_target: &Tensor<B, 2>,
     device: &B::Device,
@@ -805,7 +780,7 @@ where
     }
 
     for _ in 0..steps {
-        let batch_index = data_state.next_batch()?;
+        let batch_index = sampler.next_batch()?;
         let (input, target) = nonlinear_mini_batch::<B>(batch_index, device);
         let loss = MseLoss::new().forward(model.forward(input), target, Reduction::Mean);
         let gradients = loss.backward();
@@ -894,27 +869,6 @@ where
         final_data_position,
         final_generator_state,
     })
-}
-
-fn seeded_epoch_permutation(generator_state: &mut u64) -> Vec<usize> {
-    let mut permutation: Vec<_> = (0..MINI_BATCH_COUNT).collect();
-    if splitmix64(generator_state) & 1 == 1 {
-        permutation.swap(0, 1);
-    }
-    permutation
-}
-
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut value = *state;
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
-fn is_valid_mini_batch_permutation(permutation: &[usize]) -> bool {
-    permutation.len() == MINI_BATCH_COUNT
-        && (0..MINI_BATCH_COUNT).all(|batch| permutation.contains(&batch))
 }
 
 fn nonlinear_parameters<B>(model: &NonlinearModel<B>) -> Result<Vec<f32>, ProbeError>
@@ -1117,9 +1071,9 @@ mod tests {
     };
 
     use super::{
-        CustomOpProbeResult, MINI_BATCH_CHECKPOINT_STEP, MINI_BATCH_EPOCH_SEED, MiniBatchDataState,
-        OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_STEPS, ProbeResult, QuadraticTrainingPath,
-        TrainingProbeResult, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+        CustomOpProbeResult, MINI_BATCH_CHECKPOINT_STEP, OPTIMIZER_CHECKPOINT_STEP,
+        OPTIMIZER_PROBE_STEPS, ProbeResult, QuadraticTrainingPath, TrainingProbeResult,
+        quadratic_reference, run_autodiff_probe, run_custom_op_probe,
         run_minibatch_checkpoint_probe, run_nonlinear_checkpoint_probe,
         run_optimizer_checkpoint_probe, run_optimizer_probe,
         run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
@@ -1276,35 +1230,6 @@ mod tests {
                 0.201_636_57,
             ],
         );
-    }
-
-    #[test]
-    fn seeded_epoch_permutations_are_reproducible_and_checkpoint_sensitive() {
-        let mut state = MiniBatchDataState::default();
-        let before_checkpoint: Vec<_> = (0..MINI_BATCH_CHECKPOINT_STEP)
-            .map(|_| state.next_batch().unwrap())
-            .collect();
-        let mut resumed_state = state.clone();
-        let after_checkpoint: Vec<_> = (MINI_BATCH_CHECKPOINT_STEP..OPTIMIZER_PROBE_STEPS)
-            .map(|_| resumed_state.next_batch().unwrap())
-            .collect();
-        let mut reset_generator_state = state.clone();
-        reset_generator_state.generator_state = MINI_BATCH_EPOCH_SEED;
-        let reset_generator_second_half: Vec<_> = (MINI_BATCH_CHECKPOINT_STEP
-            ..OPTIMIZER_PROBE_STEPS)
-            .map(|_| reset_generator_state.next_batch().unwrap())
-            .collect();
-        let mut reset_permutation_state = state.clone();
-        reset_permutation_state.current_permutation = vec![0, 1];
-        let reset_permutation_next_batch = reset_permutation_state.next_batch().unwrap();
-
-        assert_eq!(MINI_BATCH_EPOCH_SEED, 0x5EED_CAFE_D15C_A11E);
-        assert_eq!(before_checkpoint, [0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1]);
-        assert_eq!(state.next_position, 1);
-        assert_eq!(state.current_permutation, [1, 0]);
-        assert_eq!(after_checkpoint, [0, 0, 1, 1, 0, 0, 1, 0, 1]);
-        assert_ne!(after_checkpoint, reset_generator_second_half);
-        assert_ne!(after_checkpoint[0], reset_permutation_next_batch);
     }
 
     #[test]

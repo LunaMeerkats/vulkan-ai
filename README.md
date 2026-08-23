@@ -83,6 +83,12 @@ uninterrupted and resumed CPU/Vulkan training. The next batch differs if either
 the current permutation or the generator is reset, so both failure modes are
 detectable.
 
+The seeded two-batch schedule and its serializable cursor are isolated in the
+crate's data module. Training code requests the next batch identifier through
+that boundary instead of reading or mutating generator, permutation, or cursor
+fields directly; the checkpoint record retains the same three state fields and
+the same consumed order.
+
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
 synchronization, and host readback is excluded. The report records the build
@@ -150,9 +156,9 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Extract the proven sampler state machine behind a small data-loading
-  boundary without weakening its seeded-order or checkpoint guarantees. The
-  quadratic experiments do not justify lower-level Vulkan interoperability.
+- Generalize the extracted sampler beyond the two-batch fixture only after a
+  representative deterministic shuffle and checkpoint protocol is specified.
+  The quadratic experiments do not justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

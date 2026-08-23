@@ -46,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and epoch-position state plus explicit generator-reset detection.
 - Inside-epoch mini-batch checkpoint/resume coverage that proves the current
   permutation and cursor both survive serialization.
+- Internal seeded batch-sampler boundary that separates checkpointable data
+  ordering from model and optimizer execution without changing the fixed run.
 
 ### Fixed
 
