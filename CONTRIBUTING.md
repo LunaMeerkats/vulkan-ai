@@ -79,6 +79,9 @@ parameter in uninterrupted/resumed and CPU/Vulkan comparisons.
 Mini-batch changes must also preserve the deterministic batch sequence and
 full-dataset evaluation trajectory. The current two-batch protocol uses
 SplitMix64 with seed `0x5eedcafed15ca11e` to generate each epoch permutation.
+Keep ordering and checkpoint invariants behind the internal data-module
+boundary; training code must consume batch identifiers through the sampler
+rather than mutate its serialized generator, permutation, or cursor directly.
 Checkpoint after step 11 so the generator state, current permutation, and next
 epoch position are captured inside an epoch with the model and optimizer;
 restore all three records into fresh state; and verify the resumed batch
