@@ -14,15 +14,15 @@ use std::{
     time::{Duration, Instant},
 };
 use vulkan_ai::{
-    CustomOpProbeResult, CustomOpsBackend, MINI_BATCH_EPOCH_SEED, MiniBatchCheckpointProbeResult,
-    MiniBatchOptimizerProbeResult, NonlinearCheckpointProbeResult, NonlinearOptimizerProbeResult,
-    OPTIMIZER_CHECKPOINT_DAMPENING, OPTIMIZER_CHECKPOINT_MOMENTUM, OPTIMIZER_CHECKPOINT_STEP,
-    OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS, OptimizerCheckpointProbeResult,
-    OptimizerProbeResult, ProbeError, QuadraticTrainingPath, TrainingProbeResult, quadratic,
-    quadratic_reference, run_autodiff_probe, run_custom_op_probe, run_minibatch_checkpoint_probe,
-    run_nonlinear_checkpoint_probe, run_optimizer_checkpoint_probe, run_optimizer_probe,
-    run_synchronized_quadratic_training_workload, run_synchronized_training_workload,
-    run_training_probe,
+    CustomOpProbeResult, CustomOpsBackend, MINI_BATCH_CHECKPOINT_STEP, MINI_BATCH_EPOCH_SEED,
+    MiniBatchCheckpointProbeResult, MiniBatchOptimizerProbeResult, NonlinearCheckpointProbeResult,
+    NonlinearOptimizerProbeResult, OPTIMIZER_CHECKPOINT_DAMPENING, OPTIMIZER_CHECKPOINT_MOMENTUM,
+    OPTIMIZER_CHECKPOINT_STEP, OPTIMIZER_PROBE_LEARNING_RATE, OPTIMIZER_PROBE_STEPS,
+    OptimizerCheckpointProbeResult, OptimizerProbeResult, ProbeError, QuadraticTrainingPath,
+    TrainingProbeResult, quadratic, quadratic_reference, run_autodiff_probe, run_custom_op_probe,
+    run_minibatch_checkpoint_probe, run_nonlinear_checkpoint_probe, run_optimizer_checkpoint_probe,
+    run_optimizer_probe, run_synchronized_quadratic_training_workload,
+    run_synchronized_training_workload, run_training_probe,
 };
 
 const PARITY_ABSOLUTE_TOLERANCE: f32 = 1.0e-5;
@@ -639,12 +639,13 @@ fn print_nonlinear_checkpoint_results(checkpoint: &NonlinearCheckpointProbeResul
 
 fn print_minibatch_checkpoint_results(checkpoint: &MiniBatchCheckpointProbeResult) {
     println!(
-        "Vulkan mini-batch checkpoint/resume loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} momentum SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}; checkpoint restored after step {OPTIMIZER_CHECKPOINT_STEP}",
+        "Vulkan mini-batch checkpoint/resume loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} momentum SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}; checkpoint restored after step {MINI_BATCH_CHECKPOINT_STEP}",
         checkpoint.resumed.losses[0], checkpoint.resumed.losses[OPTIMIZER_PROBE_STEPS]
     );
     println!(
-        "Vulkan mini-batch epoch permutations: seed {MINI_BATCH_EPOCH_SEED:#018x}; first five epochs {:?}; restored epoch position {}; restored generator state {:#018x}",
+        "Vulkan mini-batch epoch permutations: seed {MINI_BATCH_EPOCH_SEED:#018x}; first five epochs {:?}; restored epoch permutation {:?}; restored epoch position {}; restored generator state {:#018x}",
         &checkpoint.resumed.batch_sequence[..10],
+        checkpoint.checkpoint_epoch_permutation,
         checkpoint.checkpoint_data_position,
         checkpoint.checkpoint_generator_state
     );
@@ -1141,6 +1142,13 @@ fn check_minibatch_checkpoint_parity(
         &vulkan.resumed,
     )?;
     check_index_values(
+        "mini-batch checkpoint epoch permutation",
+        "CPU",
+        &cpu.checkpoint_epoch_permutation,
+        "Vulkan",
+        &vulkan.checkpoint_epoch_permutation,
+    )?;
+    check_index_values(
         "mini-batch checkpoint data position",
         "CPU",
         &[cpu.checkpoint_data_position],
@@ -1569,6 +1577,20 @@ Vulkan compute capabilities:
     }
 
     #[test]
+    fn rejects_minibatch_checkpoint_permutation_divergence() {
+        let cpu = minibatch_checkpoint_result(0.95);
+        let mut vulkan = minibatch_checkpoint_result(0.95);
+        vulkan.checkpoint_epoch_permutation[0] = 0;
+
+        let error = check_minibatch_checkpoint_parity(&cpu, &vulkan).unwrap_err();
+
+        assert_eq!(
+            error,
+            "CPU/Vulkan mini-batch checkpoint epoch permutation differs at index 0: 1 versus 0"
+        );
+    }
+
+    #[test]
     fn rejects_minibatch_generator_state_divergence() {
         let cpu = minibatch_checkpoint_result(0.95);
         let mut vulkan = minibatch_checkpoint_result(0.95);
@@ -1832,7 +1854,8 @@ Vulkan compute capabilities:
             model_checkpoint_bytes: 300,
             optimizer_checkpoint_bytes: 400,
             data_checkpoint_bytes: 100,
-            checkpoint_data_position: 2,
+            checkpoint_data_position: 1,
+            checkpoint_epoch_permutation: vec![1, 0],
             checkpoint_generator_state: 0x1234,
         }
     }
