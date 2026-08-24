@@ -79,6 +79,10 @@ parameter in uninterrupted/resumed and CPU/Vulkan comparisons.
 Mini-batch changes must also preserve the deterministic batch sequence and
 full-dataset evaluation trajectory. The current two-batch protocol uses
 SplitMix64 with seed `0x5eedcafed15ca11e` to generate each epoch permutation.
+Follow [ADR 0003](docs/adr/0003-deterministic-multibatch-sampler.md) for the
+multi-batch contract: forward Fisher-Yates order, rejection-sampled bounded
+indices, and the fixed five-batch conformance vectors are compatibility
+requirements rather than implementation details.
 Keep ordering and checkpoint invariants behind the internal data-module
 boundary; training code must consume batch identifiers through the sampler
 rather than mutate its serialized generator, permutation, or cursor directly.
