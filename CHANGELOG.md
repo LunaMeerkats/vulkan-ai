@@ -48,6 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permutation and cursor both survive serialization.
 - Internal seeded batch-sampler boundary that separates checkpointable data
   ordering from model and optimizer execution without changing the fixed run.
+- Deterministic multi-batch forward Fisher-Yates shuffle protocol with unbiased
+  bounded sampling, fixed five-batch vectors, and inside-epoch resume coverage
+  while preserving the existing two-batch training order and generator states.
 
 ### Fixed
 

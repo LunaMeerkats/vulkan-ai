@@ -174,6 +174,7 @@ pub const OPTIMIZER_CHECKPOINT_STEP: usize = OPTIMIZER_PROBE_STEPS / 2;
 /// The odd step deliberately places the checkpoint inside a two-batch epoch so
 /// restoring only the generator or epoch position cannot reproduce the run.
 pub const MINI_BATCH_CHECKPOINT_STEP: usize = OPTIMIZER_CHECKPOINT_STEP + 1;
+const MINI_BATCH_COUNT: usize = 2;
 /// Momentum factor used by the stateful checkpoint/resume probe.
 pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
 /// Dampening factor used by the stateful checkpoint/resume probe.
@@ -216,6 +217,8 @@ pub enum ProbeError {
     DataConversion(String),
     /// Model or optimizer state could not be serialized or restored.
     CheckpointSerialization(String),
+    /// The mini-batch sampler was configured without any batches.
+    InvalidMiniBatchCount(usize),
     /// Restored mini-batch state did not identify a valid epoch position.
     InvalidMiniBatchPosition(usize),
     /// Restored mini-batch state did not contain each batch identifier exactly once.
@@ -253,6 +256,9 @@ impl fmt::Display for ProbeError {
                     formatter,
                     "could not round-trip checkpoint state: {message}"
                 )
+            }
+            Self::InvalidMiniBatchCount(batch_count) => {
+                write!(formatter, "mini-batch count {batch_count} must be positive")
             }
             Self::InvalidMiniBatchPosition(position) => {
                 write!(
@@ -322,8 +328,9 @@ impl Error for ProbeError {}
 impl From<SamplerError> for ProbeError {
     fn from(error: SamplerError) -> Self {
         match error {
-            SamplerError::InvalidPosition(position) => Self::InvalidMiniBatchPosition(position),
-            SamplerError::InvalidPermutation(permutation) => {
+            SamplerError::BatchCount(batch_count) => Self::InvalidMiniBatchCount(batch_count),
+            SamplerError::Position(position) => Self::InvalidMiniBatchPosition(position),
+            SamplerError::Permutation(permutation) => {
                 Self::InvalidMiniBatchPermutation(permutation)
             }
         }
@@ -542,7 +549,8 @@ where
     let (evaluation_input, evaluation_target) = nonlinear_training_batch::<B>(device);
 
     let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
-    let mut uninterrupted_sampler = SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED);
+    let mut uninterrupted_sampler =
+        SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, MINI_BATCH_COUNT)?;
     let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut uninterrupted_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let uninterrupted_model = run_minibatch_optimizer_updates(
@@ -565,7 +573,7 @@ where
     )?;
 
     let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
-    let mut resumed_sampler = SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED);
+    let mut resumed_sampler = SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, MINI_BATCH_COUNT)?;
     let mut resumed_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut resumed_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let resumed_model = run_minibatch_optimizer_updates(

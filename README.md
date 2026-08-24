@@ -17,6 +17,11 @@ a separate design before introducing direct Vulkan interoperability. The first
 custom forward kernel follows that boundary: Vulkan dispatches `x² + x` through
 CubeCL while Flex retains the portable Burn reference.
 
+The deterministic data-order and checkpoint contract is recorded in
+[ADR 0003](docs/adr/0003-deterministic-multibatch-sampler.md). It fixes the
+shuffle algorithm and persisted state before the probe grows beyond its current
+two-batch training fixture.
+
 ## Status
 
 Pre-alpha. There is no stable public API or release yet.
@@ -86,8 +91,12 @@ detectable.
 The seeded two-batch schedule and its serializable cursor are isolated in the
 crate's data module. Training code requests the next batch identifier through
 that boundary instead of reading or mutating generator, permutation, or cursor
-fields directly; the checkpoint record retains the same three state fields and
-the same consumed order.
+fields directly. The sampler uses a precisely specified forward Fisher-Yates
+shuffle driven by SplitMix64 and rejection-sampled bounded indices. Fixed
+five-batch conformance vectors verify that the same generator state, current
+permutation, and next position resume from inside an epoch. The current
+two-batch checkpoint record retains the same three fields, consumed order, and
+generator states.
 
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
@@ -156,9 +165,10 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Generalize the extracted sampler beyond the two-batch fixture only after a
-  representative deterministic shuffle and checkpoint protocol is specified.
-  The quadratic experiments do not justify lower-level Vulkan interoperability.
+- Connect the specified multi-batch sampler to a representative training
+  fixture and carry the existing uninterrupted/resumed CPU/Vulkan parity
+  guarantees across it before introducing external data sources. The quadratic
+  experiments do not justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.
