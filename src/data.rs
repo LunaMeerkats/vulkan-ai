@@ -177,6 +177,14 @@ mod tests {
         let resumed_after_checkpoint: Vec<_> = (CHECKPOINT_STEP..TOTAL_STEPS)
             .map(|_| resumed_sampler.next_batch().unwrap())
             .collect();
+        let mut reset_generator_sampler = checkpoint.clone();
+        reset_generator_sampler.generator_state = SEED;
+        let reset_generator_after_checkpoint: Vec<_> = (CHECKPOINT_STEP..TOTAL_STEPS)
+            .map(|_| reset_generator_sampler.next_batch().unwrap())
+            .collect();
+        let mut reset_permutation_sampler = checkpoint.clone();
+        reset_permutation_sampler.current_permutation = (0..BATCH_COUNT).collect();
+        let reset_permutation_next_batch = reset_permutation_sampler.next_batch().unwrap();
 
         assert_eq!(before_checkpoint, [3, 4, 2, 1, 0, 4, 2]);
         assert_eq!(checkpoint.current_permutation(), [4, 2, 3, 0, 1]);
@@ -187,6 +195,14 @@ mod tests {
             [3, 0, 1, 4, 1, 0, 3, 2, 0, 4]
         );
         assert_eq!(resumed_after_checkpoint, uninterrupted_after_checkpoint);
+        assert_ne!(
+            reset_generator_after_checkpoint,
+            uninterrupted_after_checkpoint
+        );
+        assert_ne!(
+            reset_permutation_next_batch,
+            uninterrupted_after_checkpoint[0]
+        );
         assert_eq!(resumed_sampler.current_permutation(), [0, 4, 1, 3, 2]);
         assert_eq!(resumed_sampler.next_position(), 2);
         assert_eq!(resumed_sampler.generator_state(), 0x4265_6696_C604_626E);

@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deterministic multi-batch forward Fisher-Yates shuffle protocol with unbiased
   bounded sampling, fixed five-batch vectors, and inside-epoch resume coverage
   while preserving the existing two-batch training order and generator states.
+- Five-batch nonlinear product training fixture with deterministic data-order,
+  full-dataset loss, serialized mid-epoch resume, and CPU/Vulkan parameter parity.
 
 ### Fixed
 

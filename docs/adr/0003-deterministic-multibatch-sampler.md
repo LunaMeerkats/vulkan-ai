@@ -56,16 +56,17 @@ After seven batches, an inside-epoch checkpoint must contain permutation
 `0x50a998cacbb081c6`. Resuming that state must reproduce the uninterrupted
 sequence.
 
-This decision generalizes only the internal sampler protocol. The training
-probe remains on its established two-batch fixture until a separate change
-extends the model-level CPU/Vulkan and checkpoint-resume evidence.
+This decision initially generalized only the internal sampler protocol. A
+follow-up connects the conformance fixture to a fixed ten-example nonlinear
+product dataset grouped into five two-example batches, preserving the specified
+order and extending model-level CPU/Vulkan and checkpoint-resume evidence.
 
 ## Consequences
 
 - Shuffle and resume behavior is reproducible across supported platforms and
   independent of third-party RNG or shuffle implementations.
-- The existing two-batch consumed order, checkpoint fields, and SplitMix64
-  states remain unchanged.
+- The five-batch training probe uses these conformance vectors directly, while
+  the earlier two-batch vectors remain covered by sampler regression tests.
 - Rejection sampling can consume more than one generator value for a swap, so
   the generator state is part of the compatibility contract and must always be
   checkpointed.
