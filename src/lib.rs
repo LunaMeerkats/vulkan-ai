@@ -171,10 +171,26 @@ pub const OPTIMIZER_PROBE_LEARNING_RATE: f64 = 0.05;
 pub const OPTIMIZER_CHECKPOINT_STEP: usize = OPTIMIZER_PROBE_STEPS / 2;
 /// Update after which [`run_minibatch_checkpoint_probe`] saves sampler state.
 ///
-/// The odd step deliberately places the checkpoint inside a two-batch epoch so
-/// restoring only the generator or epoch position cannot reproduce the run.
+/// The odd step deliberately places the checkpoint inside a five-batch epoch so
+/// restoring only the generator, permutation, or epoch position cannot
+/// reproduce the run.
 pub const MINI_BATCH_CHECKPOINT_STEP: usize = OPTIMIZER_CHECKPOINT_STEP + 1;
-const MINI_BATCH_COUNT: usize = 2;
+const MINI_BATCH_COUNT: usize = 5;
+const MINI_BATCH_SIZE: usize = 2;
+const MINI_BATCH_INPUTS: [[[f32; 2]; MINI_BATCH_SIZE]; MINI_BATCH_COUNT] = [
+    [[-1.0, -1.0], [-1.0, 1.0]],
+    [[-0.5, -1.0], [-0.5, 1.0]],
+    [[0.0, -1.0], [0.0, 1.0]],
+    [[0.5, -1.0], [0.5, 1.0]],
+    [[1.0, -1.0], [1.0, 1.0]],
+];
+const MINI_BATCH_TARGETS: [[[f32; 1]; MINI_BATCH_SIZE]; MINI_BATCH_COUNT] = [
+    [[1.0], [-1.0]],
+    [[0.5], [-0.5]],
+    [[0.0], [0.0]],
+    [[-0.5], [0.5]],
+    [[-1.0], [1.0]],
+];
 /// Momentum factor used by the stateful checkpoint/resume probe.
 pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
 /// Dampening factor used by the stateful checkpoint/resume probe.
@@ -528,12 +544,13 @@ where
 
 /// Compare uninterrupted mini-batch training with a complete checkpoint/resume run.
 ///
-/// The nonlinear dataset is split into two fixed two-example batches. A fixed
-/// seed drives a new permutation for every two-step epoch. The checkpoint after
-/// step 11 records the generator state, current permutation, and next position
-/// from inside an epoch alongside the model and optimizer. The resumed path
-/// compares the full-dataset loss trajectory, consumed batch sequence, final
-/// parameters, sampler state, and generator state with uninterrupted training.
+/// The nonlinear product dataset is a fixed `5 x 2` input grid split into five
+/// two-example batches. A fixed seed drives a new permutation for every epoch.
+/// The checkpoint after step 11 records the generator state, current permutation,
+/// and next position from inside an epoch alongside the model and optimizer. The
+/// resumed path compares the full-dataset loss trajectory, consumed batch
+/// sequence, final parameters, sampler state, and generator state with
+/// uninterrupted training.
 ///
 /// # Errors
 ///
@@ -546,7 +563,7 @@ pub fn run_minibatch_checkpoint_probe<B>(
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
-    let (evaluation_input, evaluation_target) = nonlinear_training_batch::<B>(device);
+    let (evaluation_input, evaluation_target) = multibatch_training_dataset::<B>(device);
 
     let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
     let mut uninterrupted_sampler =
@@ -1033,17 +1050,22 @@ fn nonlinear_mini_batch<B>(batch_index: usize, device: &B::Device) -> (Tensor<B,
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
-    match batch_index {
-        0 => (
-            Tensor::<B, 2>::from_floats([[-1.0, -1.0], [1.0, 1.0]], device),
-            Tensor::<B, 2>::from_floats([[1.0], [1.0]], device),
-        ),
-        1 => (
-            Tensor::<B, 2>::from_floats([[-1.0, 1.0], [1.0, -1.0]], device),
-            Tensor::<B, 2>::from_floats([[-1.0], [-1.0]], device),
-        ),
-        _ => unreachable!("mini-batch identifiers come from the fixed schedule"),
-    }
+    (
+        Tensor::<B, 2>::from_floats(MINI_BATCH_INPUTS[batch_index], device),
+        Tensor::<B, 2>::from_floats(MINI_BATCH_TARGETS[batch_index], device),
+    )
+}
+
+fn multibatch_training_dataset<B>(device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 2>)
+where
+    B: AutodiffBackend<FloatElem = f32>,
+{
+    (
+        Tensor::<B, 3>::from_floats(MINI_BATCH_INPUTS, device)
+            .reshape([MINI_BATCH_COUNT * MINI_BATCH_SIZE, 2]),
+        Tensor::<B, 3>::from_floats(MINI_BATCH_TARGETS, device)
+            .reshape([MINI_BATCH_COUNT * MINI_BATCH_SIZE, 1]),
+    )
 }
 
 fn nonlinear_training_model<B>(device: &B::Device) -> NonlinearModel<B>
@@ -1198,16 +1220,16 @@ mod tests {
         assert_eq!(result.uninterrupted.losses.len(), OPTIMIZER_PROBE_STEPS + 1);
         assert_eq!(
             result.uninterrupted.batch_sequence,
-            [0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1]
+            [3, 4, 2, 1, 0, 4, 2, 3, 0, 1, 4, 1, 0, 3, 2, 0, 4, 1, 3, 2]
         );
         assert_eq!(MINI_BATCH_CHECKPOINT_STEP, 11);
         assert_eq!(result.checkpoint_data_position, 1);
-        assert_eq!(result.checkpoint_epoch_permutation, [1, 0]);
-        assert_eq!(result.uninterrupted.final_data_position, 2);
-        assert_eq!(result.checkpoint_generator_state, 0x143A_A557_CD1B_899C);
+        assert_eq!(result.checkpoint_epoch_permutation, [4, 1, 0, 3, 2]);
+        assert_eq!(result.checkpoint_generator_state, 0xC987_7FB0_C8DA_721A);
+        assert_eq!(result.uninterrupted.final_data_position, 5);
         assert_eq!(
             result.uninterrupted.final_generator_state,
-            0x8D18_8C3D_CA45_79F0
+            0x4265_6696_C604_626E
         );
         assert!(result.model_checkpoint_bytes > 0);
         assert!(result.optimizer_checkpoint_bytes > 0);
@@ -1215,27 +1237,27 @@ mod tests {
         assert!(
             result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS] < result.uninterrupted.losses[0]
         );
-        assert_values_close(&[result.uninterrupted.losses[0]], &[1.067_263_4]);
+        assert_values_close(&[result.uninterrupted.losses[0]], &[0.552_909_14]);
         assert_values_close(
             &[result.uninterrupted.losses[OPTIMIZER_PROBE_STEPS]],
-            &[1.036_678],
+            &[0.499_564_65],
         );
         assert_values_close(
             &result.uninterrupted.final_parameters,
             &[
-                0.245_957_75,
-                -0.341_024_52,
-                -0.011_708_6,
-                -0.162_310_63,
-                0.505_213,
-                0.445_480_6,
-                0.113_312_036,
-                -0.443_499_77,
-                -0.046_578_33,
-                -0.091_466_64,
-                -0.273_467_15,
-                0.097_917_41,
-                0.201_636_57,
+                0.323_447_26,
+                -0.286_213_43,
+                0.036_966_48,
+                0.006_780_087,
+                0.218_331_47,
+                0.189_097_76,
+                0.144_874_41,
+                -0.215_510_09,
+                -0.020_334_823,
+                -0.102_201_834,
+                -0.139_567_6,
+                -0.060_481_966,
+                0.018_556_682,
             ],
         );
     }

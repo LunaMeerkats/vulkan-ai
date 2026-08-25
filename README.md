@@ -19,8 +19,8 @@ CubeCL while Flex retains the portable Burn reference.
 
 The deterministic data-order and checkpoint contract is recorded in
 [ADR 0003](docs/adr/0003-deterministic-multibatch-sampler.md). It fixes the
-shuffle algorithm and persisted state before the probe grows beyond its current
-two-batch training fixture.
+shuffle algorithm and persisted state used by the current five-batch training
+fixture.
 
 ## Status
 
@@ -76,27 +76,24 @@ loss trajectory and every parameter across CPU and Vulkan. This extends the
 compatibility evidence beyond a single affine layer without introducing random
 initialization or data ordering.
 
-A mini-batch checkpoint probe splits that nonlinear dataset into two fixed
-two-example batches and uses SplitMix64 with the fixed seed
-`0x5eedcafed15ca11e` to create a new permutation for every epoch. At the
-checkpoint after update 11, the probe serializes the generator state, current
-permutation, and next epoch position from inside a two-step epoch as named
-MessagePack alongside the model and optimizer, then restores all three records
-into fresh state. It compares the consumed batch sequence, full-dataset loss
-after every update, final sampler state, and all model parameters for
-uninterrupted and resumed CPU/Vulkan training. The next batch differs if either
-the current permutation or the generator is reset, so both failure modes are
-detectable.
+A mini-batch checkpoint probe evaluates the nonlinear product target on the
+fixed Cartesian grid `x1 in {-1, -0.5, 0, 0.5, 1}` and `x2 in {-1, 1}`. The ten
+examples are grouped into five deterministic two-example batches by `x1`.
+SplitMix64 with the fixed seed `0x5eedcafed15ca11e` creates a new permutation
+for every five-step epoch. At the checkpoint after update 11, the probe
+serializes the generator state, current permutation, and next epoch position
+from inside an epoch as named MessagePack alongside the model and optimizer,
+then restores all three records into fresh state. It compares the consumed
+batch sequence, full-dataset loss after every update, final sampler state, and
+all model parameters for uninterrupted and resumed CPU/Vulkan training.
 
-The seeded two-batch schedule and its serializable cursor are isolated in the
-crate's data module. Training code requests the next batch identifier through
-that boundary instead of reading or mutating generator, permutation, or cursor
-fields directly. The sampler uses a precisely specified forward Fisher-Yates
-shuffle driven by SplitMix64 and rejection-sampled bounded indices. Fixed
-five-batch conformance vectors verify that the same generator state, current
-permutation, and next position resume from inside an epoch. The current
-two-batch checkpoint record retains the same three fields, consumed order, and
-generator states.
+The seeded schedule and its serializable cursor are isolated in the crate's
+data module. Training code requests the next batch identifier through that
+boundary instead of reading or mutating generator, permutation, or cursor
+fields directly. The sampler uses the forward Fisher-Yates and rejection-
+sampled bounded-index protocol specified in ADR 0003. The five-batch training
+probe shares its conformance vectors and proves that resetting either the
+generator or current permutation changes the post-checkpoint order.
 
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
@@ -156,19 +153,19 @@ Vulkan checkpoint/resume loss: 0.92354155 -> 0.13259129 over 20 momentum SGD ste
 Vulkan checkpoint size: model 321 bytes, optimizer 351 bytes
 Vulkan nonlinear checkpoint/resume loss: 1.0672634 -> 0.9552125 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 10 (momentum 0.9, dampening 0.1)
 Vulkan nonlinear checkpoint size: model 492 bytes, optimizer 536 bytes
-Vulkan mini-batch checkpoint/resume loss: 1.0672634 -> 1.036678 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 11
-Vulkan mini-batch epoch permutations: seed 0x5eedcafed15ca11e; first five epochs [0, 1, 1, 0, 0, 1, 1, 0, 1, 0]; restored epoch permutation [1, 0]; restored epoch position 1; restored generator state 0x143aa557cd1b899c
-Vulkan mini-batch checkpoint size: model 492 bytes, optimizer 536 bytes, sampler state 257 bytes
+Vulkan five-batch checkpoint/resume loss: 0.55290914 -> 0.49956465 over 20 momentum SGD steps at learning rate 0.05; checkpoint restored after step 11
+Vulkan five-batch epoch permutations: seed 0x5eedcafed15ca11e; first two epochs [3, 4, 2, 1, 0, 4, 2, 3, 0, 1]; restored epoch permutation [4, 1, 0, 3, 2]; restored epoch position 1; restored generator state 0xc9877fb0c8da721a
+Vulkan five-batch checkpoint size: model 492 bytes, optimizer 536 bytes, sampler state 260 bytes
 Vulkan custom quadratic output: [2.0, -0.25, 0.0, 3.75]
 Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 ```
 
 ## Near-term roadmap
 
-- Connect the specified multi-batch sampler to a representative training
-  fixture and carry the existing uninterrupted/resumed CPU/Vulkan parity
-  guarantees across it before introducing external data sources. The quadratic
-  experiments do not justify lower-level Vulkan interoperability.
+- Introduce a small in-memory dataset boundary that can serve the proven
+  five-batch fixture without changing its deterministic order, checkpoint, or
+  CPU/Vulkan parity guarantees. External data sources remain out of scope. The
+  quadratic experiments do not justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

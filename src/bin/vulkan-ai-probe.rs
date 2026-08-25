@@ -639,24 +639,24 @@ fn print_nonlinear_checkpoint_results(checkpoint: &NonlinearCheckpointProbeResul
 
 fn print_minibatch_checkpoint_results(checkpoint: &MiniBatchCheckpointProbeResult) {
     println!(
-        "Vulkan mini-batch checkpoint/resume loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} momentum SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}; checkpoint restored after step {MINI_BATCH_CHECKPOINT_STEP}",
+        "Vulkan five-batch checkpoint/resume loss: {} -> {} over {OPTIMIZER_PROBE_STEPS} momentum SGD steps at learning rate {OPTIMIZER_PROBE_LEARNING_RATE}; checkpoint restored after step {MINI_BATCH_CHECKPOINT_STEP}",
         checkpoint.resumed.losses[0], checkpoint.resumed.losses[OPTIMIZER_PROBE_STEPS]
     );
     println!(
-        "Vulkan mini-batch epoch permutations: seed {MINI_BATCH_EPOCH_SEED:#018x}; first five epochs {:?}; restored epoch permutation {:?}; restored epoch position {}; restored generator state {:#018x}",
+        "Vulkan five-batch epoch permutations: seed {MINI_BATCH_EPOCH_SEED:#018x}; first two epochs {:?}; restored epoch permutation {:?}; restored epoch position {}; restored generator state {:#018x}",
         &checkpoint.resumed.batch_sequence[..10],
         checkpoint.checkpoint_epoch_permutation,
         checkpoint.checkpoint_data_position,
         checkpoint.checkpoint_generator_state
     );
     println!(
-        "Vulkan mini-batch checkpoint size: model {} bytes, optimizer {} bytes, sampler state {} bytes",
+        "Vulkan five-batch checkpoint size: model {} bytes, optimizer {} bytes, sampler state {} bytes",
         checkpoint.model_checkpoint_bytes,
         checkpoint.optimizer_checkpoint_bytes,
         checkpoint.data_checkpoint_bytes
     );
     println!(
-        "CPU/Vulkan mini-batch uninterrupted and checkpoint-resumed parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
+        "CPU/Vulkan five-batch uninterrupted and checkpoint-resumed parity: passed (absolute tolerance {PARITY_ABSOLUTE_TOLERANCE}, relative tolerance {PARITY_RELATIVE_TOLERANCE})"
     );
 }
 
@@ -1572,7 +1572,7 @@ Vulkan compute capabilities:
 
         assert_eq!(
             error,
-            "Vulkan uninterrupted/Vulkan resumed mini-batch sequence differs at index 1: 1 versus 0"
+            "Vulkan uninterrupted/Vulkan resumed mini-batch sequence differs at index 1: 4 versus 0"
         );
     }
 
@@ -1586,7 +1586,7 @@ Vulkan compute capabilities:
 
         assert_eq!(
             error,
-            "CPU/Vulkan mini-batch checkpoint epoch permutation differs at index 0: 1 versus 0"
+            "CPU/Vulkan mini-batch checkpoint epoch permutation differs at index 0: 4 versus 0"
         );
     }
 
@@ -1855,7 +1855,7 @@ Vulkan compute capabilities:
             optimizer_checkpoint_bytes: 400,
             data_checkpoint_bytes: 100,
             checkpoint_data_position: 1,
-            checkpoint_epoch_permutation: vec![1, 0],
+            checkpoint_epoch_permutation: vec![4, 1, 0, 3, 2],
             checkpoint_generator_state: 0x1234,
         }
     }
@@ -1863,11 +1863,11 @@ Vulkan compute capabilities:
     fn minibatch_optimizer_result(final_loss: f32) -> MiniBatchOptimizerProbeResult {
         MiniBatchOptimizerProbeResult {
             losses: vec![1.0, final_loss],
-            batch_sequence: vec![0, 1],
+            batch_sequence: vec![3, 4, 2, 1, 0],
             final_parameters: vec![
                 0.2, -0.3, 0.4, -0.1, 0.5, 0.3, 0.1, -0.2, 0.05, 0.3, -0.4, 0.2, 0.0,
             ],
-            final_data_position: 2,
+            final_data_position: 5,
             final_generator_state: 0x5678,
         }
     }
