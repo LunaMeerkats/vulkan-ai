@@ -1,6 +1,69 @@
 use burn::record::Record;
 use std::{error::Error, fmt};
 
+const PRODUCT_BATCH_SIZE: usize = 2;
+const PRODUCT_INPUT_WIDTH: usize = 2;
+const PRODUCT_TARGET_WIDTH: usize = 1;
+const PRODUCT_BATCH_COUNT: usize = 5;
+
+type ProductBatchInputs = [[f32; PRODUCT_INPUT_WIDTH]; PRODUCT_BATCH_SIZE];
+type ProductBatchTargets = [[f32; PRODUCT_TARGET_WIDTH]; PRODUCT_BATCH_SIZE];
+type ProductDatasetInputs = [ProductBatchInputs; PRODUCT_BATCH_COUNT];
+type ProductDatasetTargets = [ProductBatchTargets; PRODUCT_BATCH_COUNT];
+
+/// Backend-independent in-memory boundary for the fixed nonlinear product fixture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct InMemoryProductDataset {
+    inputs: ProductDatasetInputs,
+    targets: ProductDatasetTargets,
+}
+
+/// Proven five-batch fixture used by the checkpoint/resume compatibility probe.
+pub(crate) const FIXED_PRODUCT_DATASET: InMemoryProductDataset = InMemoryProductDataset {
+    inputs: [
+        [[-1.0, -1.0], [-1.0, 1.0]],
+        [[-0.5, -1.0], [-0.5, 1.0]],
+        [[0.0, -1.0], [0.0, 1.0]],
+        [[0.5, -1.0], [0.5, 1.0]],
+        [[1.0, -1.0], [1.0, 1.0]],
+    ],
+    targets: [
+        [[1.0], [-1.0]],
+        [[0.5], [-0.5]],
+        [[0.0], [0.0]],
+        [[-0.5], [0.5]],
+        [[-1.0], [1.0]],
+    ],
+};
+
+impl InMemoryProductDataset {
+    pub(crate) const fn batch_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    pub(crate) const fn example_count(&self) -> usize {
+        self.inputs.len() * PRODUCT_BATCH_SIZE
+    }
+
+    pub(crate) fn batch(
+        &self,
+        batch_index: usize,
+    ) -> Option<(ProductBatchInputs, ProductBatchTargets)> {
+        self.inputs
+            .get(batch_index)
+            .copied()
+            .zip(self.targets.get(batch_index).copied())
+    }
+
+    pub(crate) const fn inputs(&self) -> ProductDatasetInputs {
+        self.inputs
+    }
+
+    pub(crate) const fn targets(&self) -> ProductDatasetTargets {
+        self.targets
+    }
+}
+
 /// Checkpointable deterministic sampler for the probe's mini-batches.
 #[derive(Record, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SeededBatchSampler {
@@ -126,11 +189,26 @@ fn is_valid_permutation(permutation: &[usize]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SamplerError, SeededBatchSampler};
+    use super::{FIXED_PRODUCT_DATASET, SamplerError, SeededBatchSampler};
 
     const SEED: u64 = 0x5EED_CAFE_D15C_A11E;
     const CHECKPOINT_STEP: usize = 11;
     const TOTAL_STEPS: usize = 20;
+
+    #[test]
+    fn fixed_product_dataset_preserves_the_proven_batches() {
+        assert_eq!(FIXED_PRODUCT_DATASET.batch_count(), 5);
+        assert_eq!(FIXED_PRODUCT_DATASET.example_count(), 10);
+        assert_eq!(
+            FIXED_PRODUCT_DATASET.batch(0),
+            Some(([[-1.0, -1.0], [-1.0, 1.0]], [[1.0], [-1.0]]))
+        );
+        assert_eq!(
+            FIXED_PRODUCT_DATASET.batch(4),
+            Some(([[1.0, -1.0], [1.0, 1.0]], [[-1.0], [1.0]]))
+        );
+        assert_eq!(FIXED_PRODUCT_DATASET.batch(5), None);
+    }
 
     #[test]
     fn seeded_epochs_are_reproducible_and_checkpoint_sensitive() {

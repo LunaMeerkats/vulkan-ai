@@ -67,6 +67,10 @@ order and extending model-level CPU/Vulkan and checkpoint-resume evidence.
   independent of third-party RNG or shuffle implementations.
 - The five-batch training probe uses these conformance vectors directly, while
   the earlier two-batch vectors remain covered by sampler regression tests.
+- The fixed five-batch inputs and targets live behind a backend-independent
+  in-memory dataset boundary whose batch count configures the sampler. This
+  keeps fixture ownership out of training code without changing serialized
+  sampler state.
 - Rejection sampling can consume more than one generator value for a swap, so
   the generator state is part of the compatibility contract and must always be
   checkpointed.
