@@ -87,13 +87,16 @@ then restores all three records into fresh state. It compares the consumed
 batch sequence, full-dataset loss after every update, final sampler state, and
 all model parameters for uninterrupted and resumed CPU/Vulkan training.
 
-The seeded schedule and its serializable cursor are isolated in the crate's
-data module. Training code requests the next batch identifier through that
-boundary instead of reading or mutating generator, permutation, or cursor
-fields directly. The sampler uses the forward Fisher-Yates and rejection-
-sampled bounded-index protocol specified in ADR 0003. The five-batch training
-probe shares its conformance vectors and proves that resetting either the
-generator or current permutation changes the post-checkpoint order.
+The fixed inputs and targets now live behind a backend-independent in-memory
+dataset in the crate's data module. That boundary supplies both individual
+batches and the complete evaluation set, while its batch count configures the
+seeded sampler. Training code requests the next batch identifier through the
+sampler and resolves it through the dataset instead of owning fixture constants
+or reading and mutating generator, permutation, or cursor fields directly. The
+sampler uses the forward Fisher-Yates and rejection-sampled bounded-index
+protocol specified in ADR 0003. The five-batch training probe shares its
+conformance vectors and proves that resetting either the generator or current
+permutation changes the post-checkpoint order.
 
 The probe also times the same training workload with five warm-up iterations
 and 20 measured iterations. Every iteration ends with an explicit Burn backend
@@ -162,10 +165,11 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Introduce a small in-memory dataset boundary that can serve the proven
-  five-batch fixture without changing its deterministic order, checkpoint, or
-  CPU/Vulkan parity guarantees. External data sources remain out of scope. The
-  quadratic experiments do not justify lower-level Vulkan interoperability.
+- Introduce a small sampled-dataset cursor that pairs the fixed in-memory
+  fixture with the specified sampler while leaving serialized sampler state
+  unchanged. Prove the same order, checkpoint, and CPU/Vulkan parity before
+  considering file-backed or external data. The quadratic experiments do not
+  justify lower-level Vulkan interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.

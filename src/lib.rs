@@ -5,7 +5,7 @@
 mod data;
 mod ops;
 
-use data::{SamplerError, SeededBatchSampler};
+use data::{FIXED_PRODUCT_DATASET, InMemoryProductDataset, SamplerError, SeededBatchSampler};
 
 use burn::{
     module::{AutodiffModule, Module, Param},
@@ -175,22 +175,6 @@ pub const OPTIMIZER_CHECKPOINT_STEP: usize = OPTIMIZER_PROBE_STEPS / 2;
 /// restoring only the generator, permutation, or epoch position cannot
 /// reproduce the run.
 pub const MINI_BATCH_CHECKPOINT_STEP: usize = OPTIMIZER_CHECKPOINT_STEP + 1;
-const MINI_BATCH_COUNT: usize = 5;
-const MINI_BATCH_SIZE: usize = 2;
-const MINI_BATCH_INPUTS: [[[f32; 2]; MINI_BATCH_SIZE]; MINI_BATCH_COUNT] = [
-    [[-1.0, -1.0], [-1.0, 1.0]],
-    [[-0.5, -1.0], [-0.5, 1.0]],
-    [[0.0, -1.0], [0.0, 1.0]],
-    [[0.5, -1.0], [0.5, 1.0]],
-    [[1.0, -1.0], [1.0, 1.0]],
-];
-const MINI_BATCH_TARGETS: [[[f32; 1]; MINI_BATCH_SIZE]; MINI_BATCH_COUNT] = [
-    [[1.0], [-1.0]],
-    [[0.5], [-0.5]],
-    [[0.0], [0.0]],
-    [[-0.5], [0.5]],
-    [[-1.0], [1.0]],
-];
 /// Momentum factor used by the stateful checkpoint/resume probe.
 pub const OPTIMIZER_CHECKPOINT_MOMENTUM: f64 = 0.9;
 /// Dampening factor used by the stateful checkpoint/resume probe.
@@ -563,17 +547,19 @@ pub fn run_minibatch_checkpoint_probe<B>(
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
-    let (evaluation_input, evaluation_target) = multibatch_training_dataset::<B>(device);
+    let dataset = &FIXED_PRODUCT_DATASET;
+    let (evaluation_input, evaluation_target) = multibatch_training_dataset::<B>(dataset, device);
 
     let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
     let mut uninterrupted_sampler =
-        SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, MINI_BATCH_COUNT)?;
+        SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, dataset.batch_count())?;
     let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut uninterrupted_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let uninterrupted_model = run_minibatch_optimizer_updates(
         nonlinear_training_model::<B>(device),
         &mut uninterrupted_optimizer,
         &mut uninterrupted_sampler,
+        dataset,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -590,13 +576,15 @@ where
     )?;
 
     let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
-    let mut resumed_sampler = SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, MINI_BATCH_COUNT)?;
+    let mut resumed_sampler =
+        SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, dataset.batch_count())?;
     let mut resumed_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut resumed_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let resumed_model = run_minibatch_optimizer_updates(
         nonlinear_training_model::<B>(device),
         &mut resumed_optimizer,
         &mut resumed_sampler,
+        dataset,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -636,6 +624,7 @@ where
         restored_model,
         &mut restored_optimizer,
         &mut restored_sampler,
+        dataset,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -785,6 +774,7 @@ fn run_minibatch_optimizer_updates<B, O>(
     mut model: NonlinearModel<B>,
     optimizer: &mut O,
     sampler: &mut SeededBatchSampler,
+    dataset: &InMemoryProductDataset,
     evaluation_input: &Tensor<B, 2>,
     evaluation_target: &Tensor<B, 2>,
     device: &B::Device,
@@ -806,7 +796,7 @@ where
 
     for _ in 0..steps {
         let batch_index = sampler.next_batch()?;
-        let (input, target) = nonlinear_mini_batch::<B>(batch_index, device);
+        let (input, target) = nonlinear_mini_batch::<B>(dataset, batch_index, device);
         let loss = MseLoss::new().forward(model.forward(input), target, Reduction::Mean);
         let gradients = loss.backward();
         let gradients = GradientsParams::from_grads(gradients, &model);
@@ -1046,25 +1036,34 @@ where
     )
 }
 
-fn nonlinear_mini_batch<B>(batch_index: usize, device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 2>)
+fn nonlinear_mini_batch<B>(
+    dataset: &InMemoryProductDataset,
+    batch_index: usize,
+    device: &B::Device,
+) -> (Tensor<B, 2>, Tensor<B, 2>)
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
+    let (inputs, targets) = dataset
+        .batch(batch_index)
+        .expect("sampler batch identifiers must belong to the in-memory dataset");
     (
-        Tensor::<B, 2>::from_floats(MINI_BATCH_INPUTS[batch_index], device),
-        Tensor::<B, 2>::from_floats(MINI_BATCH_TARGETS[batch_index], device),
+        Tensor::<B, 2>::from_floats(inputs, device),
+        Tensor::<B, 2>::from_floats(targets, device),
     )
 }
 
-fn multibatch_training_dataset<B>(device: &B::Device) -> (Tensor<B, 2>, Tensor<B, 2>)
+fn multibatch_training_dataset<B>(
+    dataset: &InMemoryProductDataset,
+    device: &B::Device,
+) -> (Tensor<B, 2>, Tensor<B, 2>)
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
     (
-        Tensor::<B, 3>::from_floats(MINI_BATCH_INPUTS, device)
-            .reshape([MINI_BATCH_COUNT * MINI_BATCH_SIZE, 2]),
-        Tensor::<B, 3>::from_floats(MINI_BATCH_TARGETS, device)
-            .reshape([MINI_BATCH_COUNT * MINI_BATCH_SIZE, 1]),
+        Tensor::<B, 3>::from_floats(dataset.inputs(), device).reshape([dataset.example_count(), 2]),
+        Tensor::<B, 3>::from_floats(dataset.targets(), device)
+            .reshape([dataset.example_count(), 1]),
     )
 }
 

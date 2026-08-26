@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while preserving the existing two-batch training order and generator states.
 - Five-batch nonlinear product training fixture with deterministic data-order,
   full-dataset loss, serialized mid-epoch resume, and CPU/Vulkan parameter parity.
+- Backend-independent in-memory dataset boundary for the fixed five-batch
+  inputs, targets, batch lookup, and full-dataset evaluation source.
 
 ### Fixed
 
