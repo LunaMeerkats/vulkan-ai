@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full-dataset loss, serialized mid-epoch resume, and CPU/Vulkan parameter parity.
 - Backend-independent in-memory dataset boundary for the fixed five-batch
   inputs, targets, batch lookup, and full-dataset evaluation source.
+- Sampled-dataset cursor that couples each deterministic batch identifier with
+  its in-memory contents and validates restored sampler state without changing
+  the serialized sampler schema.
 
 ### Fixed
 
