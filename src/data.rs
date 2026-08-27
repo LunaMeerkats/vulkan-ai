@@ -6,8 +6,8 @@ const PRODUCT_INPUT_WIDTH: usize = 2;
 const PRODUCT_TARGET_WIDTH: usize = 1;
 const PRODUCT_BATCH_COUNT: usize = 5;
 
-type ProductBatchInputs = [[f32; PRODUCT_INPUT_WIDTH]; PRODUCT_BATCH_SIZE];
-type ProductBatchTargets = [[f32; PRODUCT_TARGET_WIDTH]; PRODUCT_BATCH_SIZE];
+pub(crate) type ProductBatchInputs = [[f32; PRODUCT_INPUT_WIDTH]; PRODUCT_BATCH_SIZE];
+pub(crate) type ProductBatchTargets = [[f32; PRODUCT_TARGET_WIDTH]; PRODUCT_BATCH_SIZE];
 type ProductDatasetInputs = [ProductBatchInputs; PRODUCT_BATCH_COUNT];
 type ProductDatasetTargets = [ProductBatchTargets; PRODUCT_BATCH_COUNT];
 
@@ -72,12 +72,61 @@ pub(crate) struct SeededBatchSampler {
     next_position: usize,
 }
 
+/// Couples the fixed dataset with its checkpointable batch-order state.
+#[derive(Debug)]
+pub(crate) struct SampledDatasetCursor<'a> {
+    dataset: &'a InMemoryProductDataset,
+    sampler: SeededBatchSampler,
+}
+
 /// Invalid sampler configuration or state recovered from a checkpoint.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SamplerError {
     BatchCount(usize),
+    DatasetBatchCount { dataset: usize, sampler: usize },
     Position(usize),
     Permutation(Vec<usize>),
+}
+
+impl<'a> SampledDatasetCursor<'a> {
+    pub(crate) fn new(
+        dataset: &'a InMemoryProductDataset,
+        seed: u64,
+    ) -> Result<Self, SamplerError> {
+        let sampler = SeededBatchSampler::new(seed, dataset.batch_count())?;
+        Self::from_sampler(dataset, sampler)
+    }
+
+    pub(crate) fn from_sampler(
+        dataset: &'a InMemoryProductDataset,
+        sampler: SeededBatchSampler,
+    ) -> Result<Self, SamplerError> {
+        let sampler_batch_count = sampler.current_permutation.len();
+        if sampler_batch_count != dataset.batch_count() {
+            return Err(SamplerError::DatasetBatchCount {
+                dataset: dataset.batch_count(),
+                sampler: sampler_batch_count,
+            });
+        }
+
+        Ok(Self { dataset, sampler })
+    }
+
+    pub(crate) fn next_batch(
+        &mut self,
+    ) -> Result<(usize, ProductBatchInputs, ProductBatchTargets), SamplerError> {
+        let batch_index = self.sampler.next_batch()?;
+        let (inputs, targets) = self
+            .dataset
+            .batch(batch_index)
+            .expect("paired sampler identifiers must belong to the dataset");
+
+        Ok((batch_index, inputs, targets))
+    }
+
+    pub(crate) const fn sampler(&self) -> &SeededBatchSampler {
+        &self.sampler
+    }
 }
 
 impl SeededBatchSampler {
@@ -132,6 +181,12 @@ impl fmt::Display for SamplerError {
                 write!(
                     formatter,
                     "sampler batch count {batch_count} must be positive"
+                )
+            }
+            Self::DatasetBatchCount { dataset, sampler } => {
+                write!(
+                    formatter,
+                    "sampler batch count {sampler} does not match dataset batch count {dataset}"
                 )
             }
             Self::Position(position) => {
@@ -189,7 +244,7 @@ fn is_valid_permutation(permutation: &[usize]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIXED_PRODUCT_DATASET, SamplerError, SeededBatchSampler};
+    use super::{FIXED_PRODUCT_DATASET, SampledDatasetCursor, SamplerError, SeededBatchSampler};
 
     const SEED: u64 = 0x5EED_CAFE_D15C_A11E;
     const CHECKPOINT_STEP: usize = 11;
@@ -208,6 +263,36 @@ mod tests {
             Some(([[1.0, -1.0], [1.0, 1.0]], [[-1.0], [1.0]]))
         );
         assert_eq!(FIXED_PRODUCT_DATASET.batch(5), None);
+    }
+
+    #[test]
+    fn sampled_dataset_cursor_pairs_the_proven_order_with_batch_contents() {
+        let mut cursor = SampledDatasetCursor::new(&FIXED_PRODUCT_DATASET, SEED).unwrap();
+        let (first_index, first_inputs, first_targets) = cursor.next_batch().unwrap();
+        let remaining_indices: Vec<_> = (1..7).map(|_| cursor.next_batch().unwrap().0).collect();
+
+        assert_eq!(first_index, 3);
+        assert_eq!(first_inputs, [[0.5, -1.0], [0.5, 1.0]]);
+        assert_eq!(first_targets, [[-0.5], [0.5]]);
+        assert_eq!(remaining_indices, [4, 2, 1, 0, 4, 2]);
+        assert_eq!(cursor.sampler().current_permutation(), [4, 2, 3, 0, 1]);
+        assert_eq!(cursor.sampler().next_position(), 2);
+        assert_eq!(cursor.sampler().generator_state(), 0x50A9_98CA_CBB0_81C6);
+    }
+
+    #[test]
+    fn sampled_dataset_cursor_rejects_a_mismatched_restored_sampler() {
+        let sampler = SeededBatchSampler::new(SEED, 2).unwrap();
+        let error = SampledDatasetCursor::from_sampler(&FIXED_PRODUCT_DATASET, sampler)
+            .expect_err("two sampler batches must not pair with the five-batch dataset");
+
+        assert_eq!(
+            error,
+            SamplerError::DatasetBatchCount {
+                dataset: 5,
+                sampler: 2,
+            }
+        );
     }
 
     #[test]

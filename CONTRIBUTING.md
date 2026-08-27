@@ -87,9 +87,13 @@ Keep ordering and checkpoint invariants behind the internal data-module
 boundary; training code must consume batch identifiers through the sampler
 rather than mutate its serialized generator, permutation, or cursor directly.
 Keep the fixed product inputs and targets behind `InMemoryProductDataset`, use
-that dataset's batch count to configure the sampler, and materialize individual
-batches and the full evaluation set from that single source. Dataset refactors
-must preserve all ten examples and their five two-example groupings.
+`SampledDatasetCursor` to pair that dataset with sampler state, and materialize
+individual batches and the full evaluation set from that single source.
+Training code must consume the batch identifier and contents together through
+the cursor. Continue to checkpoint only the inner `SeededBatchSampler`; after
+restore, the cursor must reject a sampler whose batch count does not match the
+dataset. Dataset refactors must preserve all ten examples and their five
+two-example groupings.
 Checkpoint after step 11 so the generator state, current permutation
 `[4, 1, 0, 3, 2]`, and next epoch position `1` are captured inside an epoch with
 the model and optimizer; restore all three records into fresh state; and verify

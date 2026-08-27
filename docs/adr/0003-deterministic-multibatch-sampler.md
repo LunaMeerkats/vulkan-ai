@@ -71,6 +71,10 @@ order and extending model-level CPU/Vulkan and checkpoint-resume evidence.
   in-memory dataset boundary whose batch count configures the sampler. This
   keeps fixture ownership out of training code without changing serialized
   sampler state.
+- A sampled-dataset cursor pairs that dataset with the sampler, returns each
+  identifier and its batch contents as one operation, and rejects restored
+  sampler state with a different batch count. Checkpoints still serialize the
+  three-field sampler record rather than the dataset or cursor.
 - Rejection sampling can consume more than one generator value for a swap, so
   the generator state is part of the compatibility contract and must always be
   checkpointed.

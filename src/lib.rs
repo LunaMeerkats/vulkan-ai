@@ -5,7 +5,10 @@
 mod data;
 mod ops;
 
-use data::{FIXED_PRODUCT_DATASET, InMemoryProductDataset, SamplerError, SeededBatchSampler};
+use data::{
+    FIXED_PRODUCT_DATASET, InMemoryProductDataset, ProductBatchInputs, ProductBatchTargets,
+    SampledDatasetCursor, SamplerError,
+};
 
 use burn::{
     module::{AutodiffModule, Module, Param},
@@ -219,6 +222,13 @@ pub enum ProbeError {
     CheckpointSerialization(String),
     /// The mini-batch sampler was configured without any batches.
     InvalidMiniBatchCount(usize),
+    /// Restored mini-batch state does not describe the paired dataset.
+    MiniBatchDatasetMismatch {
+        /// Number of batches exposed by the dataset.
+        dataset: usize,
+        /// Number of batches encoded by the sampler permutation.
+        sampler: usize,
+    },
     /// Restored mini-batch state did not identify a valid epoch position.
     InvalidMiniBatchPosition(usize),
     /// Restored mini-batch state did not contain each batch identifier exactly once.
@@ -259,6 +269,12 @@ impl fmt::Display for ProbeError {
             }
             Self::InvalidMiniBatchCount(batch_count) => {
                 write!(formatter, "mini-batch count {batch_count} must be positive")
+            }
+            Self::MiniBatchDatasetMismatch { dataset, sampler } => {
+                write!(
+                    formatter,
+                    "mini-batch sampler count {sampler} does not match dataset count {dataset}"
+                )
             }
             Self::InvalidMiniBatchPosition(position) => {
                 write!(
@@ -329,6 +345,9 @@ impl From<SamplerError> for ProbeError {
     fn from(error: SamplerError) -> Self {
         match error {
             SamplerError::BatchCount(batch_count) => Self::InvalidMiniBatchCount(batch_count),
+            SamplerError::DatasetBatchCount { dataset, sampler } => {
+                Self::MiniBatchDatasetMismatch { dataset, sampler }
+            }
             SamplerError::Position(position) => Self::InvalidMiniBatchPosition(position),
             SamplerError::Permutation(permutation) => {
                 Self::InvalidMiniBatchPermutation(permutation)
@@ -551,15 +570,13 @@ where
     let (evaluation_input, evaluation_target) = multibatch_training_dataset::<B>(dataset, device);
 
     let mut uninterrupted_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
-    let mut uninterrupted_sampler =
-        SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, dataset.batch_count())?;
+    let mut uninterrupted_cursor = SampledDatasetCursor::new(dataset, MINI_BATCH_EPOCH_SEED)?;
     let mut uninterrupted_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut uninterrupted_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let uninterrupted_model = run_minibatch_optimizer_updates(
         nonlinear_training_model::<B>(device),
         &mut uninterrupted_optimizer,
-        &mut uninterrupted_sampler,
-        dataset,
+        &mut uninterrupted_cursor,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -571,20 +588,18 @@ where
         &uninterrupted_model,
         uninterrupted_losses,
         uninterrupted_batches,
-        uninterrupted_sampler.next_position(),
-        uninterrupted_sampler.generator_state(),
+        uninterrupted_cursor.sampler().next_position(),
+        uninterrupted_cursor.sampler().generator_state(),
     )?;
 
     let mut resumed_optimizer = checkpoint_optimizer_config().init::<B, NonlinearModel<B>>();
-    let mut resumed_sampler =
-        SeededBatchSampler::new(MINI_BATCH_EPOCH_SEED, dataset.batch_count())?;
+    let mut resumed_cursor = SampledDatasetCursor::new(dataset, MINI_BATCH_EPOCH_SEED)?;
     let mut resumed_losses = Vec::with_capacity(OPTIMIZER_PROBE_STEPS + 1);
     let mut resumed_batches = Vec::with_capacity(OPTIMIZER_PROBE_STEPS);
     let resumed_model = run_minibatch_optimizer_updates(
         nonlinear_training_model::<B>(device),
         &mut resumed_optimizer,
-        &mut resumed_sampler,
-        dataset,
+        &mut resumed_cursor,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -599,7 +614,7 @@ where
             .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
     let optimizer_checkpoint = Recorder::<B>::record(&recorder, resumed_optimizer.to_record(), ())
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
-    let data_checkpoint = Recorder::<B>::record(&recorder, resumed_sampler.clone(), ())
+    let data_checkpoint = Recorder::<B>::record(&recorder, resumed_cursor.sampler().clone(), ())
         .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
     let model_checkpoint_bytes = model_checkpoint.len();
     let optimizer_checkpoint_bytes = optimizer_checkpoint.len();
@@ -613,18 +628,17 @@ where
     let mut restored_optimizer = checkpoint_optimizer_config()
         .init::<B, NonlinearModel<B>>()
         .load_record(restored_optimizer_record);
-    let mut restored_sampler: SeededBatchSampler =
-        Recorder::<B>::load(&recorder, data_checkpoint, device)
-            .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
-    let checkpoint_data_position = restored_sampler.next_position();
-    let checkpoint_epoch_permutation = restored_sampler.current_permutation().to_vec();
-    let checkpoint_generator_state = restored_sampler.generator_state();
+    let restored_sampler = Recorder::<B>::load(&recorder, data_checkpoint, device)
+        .map_err(|error| ProbeError::CheckpointSerialization(error.to_string()))?;
+    let mut restored_cursor = SampledDatasetCursor::from_sampler(dataset, restored_sampler)?;
+    let checkpoint_data_position = restored_cursor.sampler().next_position();
+    let checkpoint_epoch_permutation = restored_cursor.sampler().current_permutation().to_vec();
+    let checkpoint_generator_state = restored_cursor.sampler().generator_state();
 
     let resumed_model = run_minibatch_optimizer_updates(
         restored_model,
         &mut restored_optimizer,
-        &mut restored_sampler,
-        dataset,
+        &mut restored_cursor,
         &evaluation_input,
         &evaluation_target,
         device,
@@ -636,8 +650,8 @@ where
         &resumed_model,
         resumed_losses,
         resumed_batches,
-        restored_sampler.next_position(),
-        restored_sampler.generator_state(),
+        restored_cursor.sampler().next_position(),
+        restored_cursor.sampler().generator_state(),
     )?;
 
     Ok(MiniBatchCheckpointProbeResult {
@@ -773,8 +787,7 @@ where
 fn run_minibatch_optimizer_updates<B, O>(
     mut model: NonlinearModel<B>,
     optimizer: &mut O,
-    sampler: &mut SeededBatchSampler,
-    dataset: &InMemoryProductDataset,
+    cursor: &mut SampledDatasetCursor<'_>,
     evaluation_input: &Tensor<B, 2>,
     evaluation_target: &Tensor<B, 2>,
     device: &B::Device,
@@ -795,8 +808,8 @@ where
     }
 
     for _ in 0..steps {
-        let batch_index = sampler.next_batch()?;
-        let (input, target) = nonlinear_mini_batch::<B>(dataset, batch_index, device);
+        let (batch_index, inputs, targets) = cursor.next_batch()?;
+        let (input, target) = nonlinear_mini_batch::<B>(inputs, targets, device);
         let loss = MseLoss::new().forward(model.forward(input), target, Reduction::Mean);
         let gradients = loss.backward();
         let gradients = GradientsParams::from_grads(gradients, &model);
@@ -1037,16 +1050,13 @@ where
 }
 
 fn nonlinear_mini_batch<B>(
-    dataset: &InMemoryProductDataset,
-    batch_index: usize,
+    inputs: ProductBatchInputs,
+    targets: ProductBatchTargets,
     device: &B::Device,
 ) -> (Tensor<B, 2>, Tensor<B, 2>)
 where
     B: AutodiffBackend<FloatElem = f32>,
 {
-    let (inputs, targets) = dataset
-        .batch(batch_index)
-        .expect("sampler batch identifiers must belong to the in-memory dataset");
     (
         Tensor::<B, 2>::from_floats(inputs, device),
         Tensor::<B, 2>::from_floats(targets, device),

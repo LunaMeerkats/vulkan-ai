@@ -87,12 +87,13 @@ then restores all three records into fresh state. It compares the consumed
 batch sequence, full-dataset loss after every update, final sampler state, and
 all model parameters for uninterrupted and resumed CPU/Vulkan training.
 
-The fixed inputs and targets now live behind a backend-independent in-memory
-dataset in the crate's data module. That boundary supplies both individual
-batches and the complete evaluation set, while its batch count configures the
-seeded sampler. Training code requests the next batch identifier through the
-sampler and resolves it through the dataset instead of owning fixture constants
-or reading and mutating generator, permutation, or cursor fields directly. The
+The fixed inputs and targets live behind a backend-independent in-memory
+dataset in the crate's data module. A sampled-dataset cursor pairs that fixture
+with its seeded sampler and yields each batch identifier and contents together,
+so training code cannot advance data order separately from batch lookup. The
+cursor validates restored sampler state against the dataset batch count, while
+checkpoints continue to serialize only the sampler's generator, permutation,
+and next position. The dataset also supplies the complete evaluation set. The
 sampler uses the forward Fisher-Yates and rejection-sampled bounded-index
 protocol specified in ADR 0003. The five-batch training probe shares its
 conformance vectors and proves that resetting either the generator or current
@@ -165,11 +166,10 @@ Vulkan custom quadratic input gradient: [-3.0, 0.0, 1.0, 4.0]
 
 ## Near-term roadmap
 
-- Introduce a small sampled-dataset cursor that pairs the fixed in-memory
-  fixture with the specified sampler while leaving serialized sampler state
-  unchanged. Prove the same order, checkpoint, and CPU/Vulkan parity before
-  considering file-backed or external data. The quadratic experiments do not
-  justify lower-level Vulkan interoperability.
+- Define how a data checkpoint binds sampler state to dataset identity before
+  introducing a second fixture or any file-backed source. External data remains
+  out of scope, and the quadratic experiments do not justify lower-level Vulkan
+  interoperability.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes. This project is
 licensed under the Apache License 2.0.
